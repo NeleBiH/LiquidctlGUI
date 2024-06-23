@@ -15,7 +15,7 @@ pip3 install liquidctl
 So what works and what not(atleast on my system)
 ----------------------------------------------------------------------------------
 -list devices  --it it lists devices installed in your pc supported by liquidctl
--get status    --fan speeds,pump speeds,number of fans and water temp
+-get status     --fan speeds,pump speeds,number of fans and water temp
 -setting fan speed   --sets all fan speed to a given slider position
 -setting pump speed  --sets pump speed to a given slider position
 -error handling --it outputs state and possible errors
