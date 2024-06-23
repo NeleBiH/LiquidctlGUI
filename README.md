@@ -9,9 +9,9 @@ pip3 install liquidctl
 pip3 install pyqt5
 
 
-![Screenshot_20240623_005616](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/f120e303-b2cd-4337-9431-1b435be0bce1)
+![Screenshot_20240623_035825](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/ec5c0413-88c1-4d53-b81f-1c25b6d39b06)
+![Liquidctl GUI](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/440cad7f-ece4-47c5-9cc8-12f6387473dc)
 
-![Screenshot_20240623_033421](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/a176cbe7-764d-4551-9815-16311d475166)
 
 So what works and what not(atleast on my system)
 ----------------------------------------------------------------------------------
