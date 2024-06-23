@@ -7,7 +7,7 @@ class LiquidCtlGUI(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("LiquidCTL GUI - iCUE Style")
+        self.setWindowTitle("LiquidCTL GUI")
         self.setGeometry(100, 100, 800, 600)
 
         self.initUI()
