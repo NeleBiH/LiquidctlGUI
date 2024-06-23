@@ -2,10 +2,20 @@
 LiquidctlGUI is attempt of creating simple interface for liquidctl (https://github.com/liquidctl/liquidctl) using AI 
 because i am not coder and your cat might be set on fire if you run this code so no any promises😉
 
+
+
 You have to have liquidctl installed search it trough your package manager or install it via terminal using pip
-udo apt update  /  sudo yum update  /  sudo dnfupdate
+
+
+sudo apt update  /  sudo yum update  /  sudo dnfupdate
+
+
 sudo apt or yum or dnf install python3 python3-pip
+
+
 pip3 install liquidctl
+
+
 pip3 install pyqt5
 
 
