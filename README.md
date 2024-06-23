@@ -6,6 +6,7 @@ You have to have liquidctl installed search it trough your package manager or in
 udo apt update  /  sudo yum update  /  sudo dnfupdate
 sudo apt or yum or dnf install python3 python3-pip
 pip3 install liquidctl
+pip3 install pyqt5
 
 
 ![Screenshot_20240623_005616](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/f120e303-b2cd-4337-9431-1b435be0bce1)
