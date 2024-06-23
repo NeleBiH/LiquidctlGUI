@@ -25,25 +25,39 @@ pip3 install pyqt5
 
 So what works and what not(atleast on my system)
 ----------------------------------------------------------------------------------
+
 -list devices  --it it lists devices installed in your pc supported by liquidctl
+
 -get status     --fan speeds,pump speeds,number of fans and water temp
+
 -setting fan speed   --sets all fan speed to a given slider position
+
 -setting pump speed  --sets pump speed to a given slider position
+
 -error handling --it outputs state and possible errors
+
 
 What it doesnt work or it is bugged
 ---------------------------------------------------------------------------------
+
 -rgb control is curently unsupported on my system using crosair H170 water cooling
+
 -rgb lights sometimes blink when setting fan and pump speed,why idk
+
 
 What i would like to add
 --------------------------------------
 -program icon
+
 -tray icon
+
 -controls from try icon on right click
 -saving settings
+
 -system info on side
+
 -actuall working rgb control 
+
 
 
 
