@@ -16,11 +16,11 @@ sudo apt or yum or dnf install python3 python3-pip
 pip3 install liquidctl
 
 
-pip3 install pyqt5
+pip3 install pyqt6
 
 
-![Screenshot_20240623_035825](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/ec5c0413-88c1-4d53-b81f-1c25b6d39b06)
-![Liquidctl GUI](https://github.com/NeleBiH/LiquidctlGUI/assets/86635498/440cad7f-ece4-47c5-9cc8-12f6387473dc)
+<img width="799" height="516" alt="Screenshot_20250717_232045" src="https://github.com/user-attachments/assets/cc34e465-027c-4783-a83d-39fd44eb69e6" />
+<img width="804" height="526" alt="1" src="https://github.com/user-attachments/assets/813ab3e3-97fa-4a2e-8c29-0fb380bff942" />
 
 
 So what works and what not(atleast on my system)
@@ -34,7 +34,6 @@ So what works and what not(atleast on my system)
 
 -setting pump speed  --sets pump speed to a given slider position
 
--error handling --it outputs state and possible errors
 
 
 What it doesnt work or it is bugged
@@ -48,15 +47,8 @@ What it doesnt work or it is bugged
 What i would like to add
 --------------------------------------
 -program icon
-
--tray icon
-
--controls from try icon on right click
--saving settings
-
--system info on side
-
 -actuall working rgb control 
+-settings to save or load saved user settings
 
 
 
