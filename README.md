@@ -25,7 +25,7 @@ pip3 install pyqt6
 So what works and what not(atleast on my system)
 ----------------------------------------------------------------------------------
 
--list devices  --it it lists devices installed in your pc supported by liquidctl
+-list devices  --it lists devices installed in your pc supported by liquidctl
 
 -get status     --fan speeds,pump speeds,number of fans and water temp
 
@@ -47,7 +47,9 @@ What it doesnt work or it is bugged
 What i would like to add
 --------------------------------------
 -program icon
+
 -actuall working rgb control 
+
 -settings to save or load saved user settings
 
 
