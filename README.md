@@ -18,9 +18,8 @@ pip3 install liquidctl
 
 pip3 install pyqt6
 
-
-<img width="799" height="516" alt="Screenshot_20250717_232045" src="https://github.com/user-attachments/assets/cc34e465-027c-4783-a83d-39fd44eb69e6" />
 <img width="804" height="526" alt="1" src="https://github.com/user-attachments/assets/813ab3e3-97fa-4a2e-8c29-0fb380bff942" />
+<img width="799" height="516" alt="Screenshot_20250717_232045" src="https://github.com/user-attachments/assets/cc34e465-027c-4783-a83d-39fd44eb69e6" />
 
 
 So what works and what not(atleast on my system)
@@ -34,14 +33,15 @@ So what works and what not(atleast on my system)
 
 -setting pump speed  --sets pump speed to a given slider position
 
+-profiles work partialy i need to change to save them into some config in home folder
+
 
 
 What it doesnt work or it is bugged
 ---------------------------------------------------------------------------------
 
--rgb control is curently unsupported on my system using crosair H170 water cooling
-
--rgb lights sometimes blink when setting fan and pump speed,why idk
+-rgb control is curently unsupported on my system using crosair H170 water cooling it has broken status on liquidctl 
+(rgb lights sometimes blink when setting fan and pump speed,why idk)
 
 
 What i would like to add
