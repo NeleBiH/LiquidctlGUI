@@ -50,6 +50,8 @@ What i would like to add
 
 -actuall working rgb control 
 
+-language support curently everything is mixed betwen croatian and englsih
+
 -settings to save or load saved user settings
 
 
