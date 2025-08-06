@@ -1,24 +1,29 @@
 import sys
 import os
-import json
 import time
 import logging
 import subprocess
 import shutil
 import threading
 import re
+import json
 from functools import partial
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QGroupBox, QComboBox,
     QSystemTrayIcon, QMenu, QMessageBox, QDialog,
-    QFormLayout, QDialogButtonBox, QLineEdit, QInputDialog, QStyle, QSpacerItem, QSizePolicy
+    QFormLayout, QDialogButtonBox, QLineEdit, QInputDialog, QStyle, QSpacerItem, QSizePolicy, QStatusBar
 )
 from PyQt6.QtGui import QIcon, QAction, QFont
 from PyQt6.QtCore import Qt, QTimer
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".LIquidctl_settings.json")
+
+if not shutil.which("liquidctl"):
+    app = QApplication(sys.argv)
+    QMessageBox.critical(None, "Error", "liquidctl is not installed! Please install it and try again.")
+    sys.exit(1)
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -27,6 +32,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_linux_distribution():
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    return line.strip().split("=")[1].strip('"')
+    except FileNotFoundError:
+        return None
+
+def install_lm_sensors(password):
+    distro = get_linux_distribution()
+    if not distro:
+        return False
+
+    install_commands = {
+        "ubuntu": "apt-get install -y lm-sensors",
+        "debian": "apt-get install -y lm-sensors",
+        "fedora": "dnf install -y lm_sensors",
+        "arch": "pacman -S --noconfirm lm-sensors",
+        "manjaro": "pacman -S --noconfirm lm-sensors",
+    }
+
+    command = install_commands.get(distro)
+    if not command:
+        return False
+
+    full_command = f'echo "{password}" | sudo -S {command}'
+    try:
+        subprocess.run(full_command, shell=True, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to install lm-sensors: {e.stderr}")
+        return False
+
+def run_sensors_detect(password):
+    full_command = f'echo "{password}" | sudo -S sensors-detect --auto'
+    try:
+        subprocess.run(full_command, shell=True, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to run sensors-detect: {e.stderr}")
+        return False
+
 def check_device_access():
     try:
         result = subprocess.run(["liquidctl", "list"], capture_output=True, text=True)
@@ -34,32 +82,32 @@ def check_device_access():
             return True
         app = QApplication(sys.argv)
         reply = QMessageBox.question(
-            None, 'Potrebne ovlasti',
-            'Za rad bez sudo-a potrebno je konfigurirati udev pravila.\n'
-            'Želite li automatski konfigurirati pravila pristupa?',
+            None, 'Permissions required',
+            'To run without sudo, udev rules must be configured.\n'
+            'Do you want to automatically configure access rules?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
             password, ok = QInputDialog.getText(
-                None, 'Potvrda',
-                'Unesite sudo lozinku za konfiguraciju:',
+                None, 'Confirmation',
+                'Enter sudo password for configuration:',
                 QLineEdit.EchoMode.Password
             )
             if ok and password:
                 udev_rule = '''SUBSYSTEM=="usb", ATTR{idVendor}=="1b1c", ATTR{idProduct}=="0c0a", MODE="0666", GROUP="plugdev"'''
                 cmd = f'echo "{password}" | sudo -S bash -c \'echo "{udev_rule}" > /etc/udev/rules.d/99-liquidctl.rules && udevadm control --reload-rules && udevadm trigger\''
                 subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                QMessageBox.information(None, 'Uspjeh', 'Udev pravila su postavljena!\nMolimo odjavite se i ponovo prijavite.')
+                QMessageBox.information(None, 'Success', 'Udev rules have been set!\nPlease log out and log back in.')
                 sys.exit(0)
     except Exception as e:
-        logger.error(f"Greška pri provjeri pristupa: {str(e)}")
+        logger.error(f"Error checking access: {str(e)}")
     return False
 
 def run_with_sudo():
     app = QApplication(sys.argv)
     password, ok = QInputDialog.getText(
-        None, 'Potrebna potvrda',
-        'Aplikacija zahtijeva root privilegije.\nUnesite sudo lozinku:',
+        None, 'Confirmation required',
+        'The application requires root privileges.\nEnter your sudo password:',
         QLineEdit.EchoMode.Password
     )
     if ok and password:
@@ -67,16 +115,13 @@ def run_with_sudo():
         subprocess.run(cmd, shell=True)
     sys.exit(0)
 
-if not check_device_access():
-    run_with_sudo()
-
 def load_json_config():
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r") as f:
                 conf = json.load(f)
             if not isinstance(conf, dict):
-                raise Exception("Nepotpuni config")
+                raise Exception("Malformed config")
             return conf
         except Exception:
             pass
@@ -113,6 +158,9 @@ def get_cpu_temp():
     except Exception as e:
         logger.error(f"CPU temp error: {e}")
         return None
+
+if not check_device_access():
+    run_with_sudo()
 
 class ProfileDialog(QDialog):
     def __init__(self, parent=None, existing_name="", fan_speeds=None, pump_speed=0, fan_count=6):
@@ -231,6 +279,7 @@ class LiquidCtlGUI(QMainWindow):
         self.tray_menu = QMenu()
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.show()
+        self.check_and_install_lm_sensors()
         self.init_ui()
         self.load_devices()
         self.update_status()
@@ -238,6 +287,33 @@ class LiquidCtlGUI(QMainWindow):
 
     def save_conf(self):
         save_json_config(self.conf)
+
+    def check_and_install_lm_sensors(self):
+        if not shutil.which("sensors"):
+            reply = QMessageBox.question(
+                self, 'lm-sensors not found',
+                'The `sensors` command is not found. This is required to display CPU temperature.\n'
+                'Do you want to automatically install `lm-sensors`?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                password, ok = QInputDialog.getText(
+                    self, 'Sudo password',
+                    'Enter your sudo password to install `lm-sensors`:',
+                    QLineEdit.EchoMode.Password
+                )
+                if ok and password:
+                    if install_lm_sensors(password):
+                        QMessageBox.information(self, 'Success', '`lm-sensors` installed successfully.')
+                        if run_sensors_detect(password):
+                            QMessageBox.information(self, 'Success', '`sensors-detect` ran successfully.')
+                        else:
+                            QMessageBox.warning(self, 'Warning', 'Failed to run `sensors-detect`.')
+                    else:
+                        QMessageBox.warning(self, 'Error', 'Failed to install `lm-sensors`.')
+
+    def show_status_message(self, message, timeout=5000):
+        self.statusBar.showMessage(message, timeout)
 
     def init_ui(self):
         self.main_widget = QWidget()
@@ -333,12 +409,12 @@ QSlider::tick-mark:horizontal {
         self.pump_slider.setStyleSheet(pump_slider_style)
         self.control_layout.addWidget(self.pump_label)
         self.control_layout.addWidget(self.pump_slider)
-        # Dinamički popunjavamo fan kontrolu
+        # Dynamically populate fan control
         self.fan_labels = []
         self.fan_sliders = []
         self.fan_status_labels = []
         self.fan_status_layout = QVBoxLayout()
-        self.add_fan_controls(6, font)  # inicijalno default 6
+        self.add_fan_controls(6, font)  # initial default 6
         self.control_group.setLayout(self.control_layout)
         main_layout.addWidget(self.control_group)
 
@@ -369,21 +445,10 @@ QSlider::tick-mark:horizontal {
         status_layout.addWidget(self.pump_temp_group)
         main_layout.addLayout(status_layout)
 
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
-        jezik_label = QLabel("Jezik:")
-        jezik_label.setFont(font)
-        bottom_layout.addWidget(jezik_label)
-        self.lang_combo = QComboBox()
-        self.lang_combo.setFont(font)
-        self.lang_combo.setMinimumHeight(48)
-        self.lang_combo.addItem("Hrvatski")
-        self.lang_combo.setCurrentIndex(0)
-        bottom_layout.addWidget(self.lang_combo)
-        main_layout.addLayout(bottom_layout)
-
         self.main_widget.setLayout(main_layout)
         self.setCentralWidget(self.main_widget)
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
         self.rebuild_tray_menu(selected_profile=self.conf["global"].get("last_profile", None))
 
     def add_fan_controls(self, count, font):
@@ -458,9 +523,9 @@ QSlider::tick-mark:horizontal {
     def rebuild_tray_menu(self, selected_profile=None):
         self.tray_menu.clear()
         if selected_profile:
-            tr = f"Trenutni profil: {selected_profile}"
+            tr = f"Current profile: {selected_profile}"
         else:
-            tr = "Trenutni profil: (nijedan)"
+            tr = "Current profile: (none)"
         current_item = QAction(tr, self)
         current_item.setEnabled(False)
         font = QFont()
@@ -501,8 +566,8 @@ QSlider::tick-mark:horizontal {
     def show_about(self):
         QMessageBox.information(self, "About", """
 Mini Corsair iCUE for Linux
-Sprema podatke i profile u ~/.LIquidctl_settings.json
-Kreator: Nele
+Saves data and profiles in ~/.LIquidctl_settings.json
+Creator: Nele
 """)
 
     def closeEvent(self, event):
@@ -510,7 +575,7 @@ Kreator: Nele
         self.hide()
         self.tray_icon.showMessage(
             "Mini Corsair iCUE",
-            "Aplikacija je minimizirana u system tray. Koristite 'Exit' za zatvaranje.",
+            "The application has been minimized to the system tray. Use 'Exit' to close.",
             QSystemTrayIcon.MessageIcon.Information, 2000
         )
 
@@ -544,9 +609,7 @@ Kreator: Nele
             data = {"fan_speeds": values["fan_speeds"], "pump_speed": values["pump_speed"]}
             self.conf.setdefault("profiles", {})
             self.conf["profiles"][pname] = data
-            self.save_conf()
-            self.update_profile_combo()
-            self.rebuild_tray_menu(selected_profile=pname)
+            self._update_profiles_ui(selected_profile=pname)
 
     def edit_profile(self):
         pname = self.profile_combo.currentData()
@@ -566,21 +629,26 @@ Kreator: Nele
             }
             if new_name != pname:
                 del self.conf["profiles"][pname]
-            self.save_conf()
-            self.update_profile_combo()
-            self.rebuild_tray_menu(selected_profile=new_name)
+            self._update_profiles_ui(selected_profile=new_name)
+            if pname == self.conf["global"].get("last_profile"):
+                self.apply_profile_and_update_ui(new_name)
 
     def delete_profile(self):
         pname = self.profile_combo.currentData()
         if not pname or pname not in self.conf.get("profiles", {}):
             QMessageBox.warning(self, "Warning", "Please select a profile to delete.")
             return
-        reply = QMessageBox.question(self, "Potvrda", "Da li ste sigurni da želite izbrisati profil?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(self, "Confirmation", "Are you sure you want to delete the profile?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
+            if pname == self.conf["global"].get("last_profile"):
+                self.conf["global"]["last_profile"] = None
             del self.conf["profiles"][pname]
-            self.save_conf()
-            self.update_profile_combo()
-            self.rebuild_tray_menu(selected_profile=None)
+            self._update_profiles_ui(selected_profile=self.conf["global"].get("last_profile"))
+
+    def _update_profiles_ui(self, selected_profile=None):
+        self.save_conf()
+        self.update_profile_combo()
+        self.rebuild_tray_menu(selected_profile=selected_profile)
 
     def apply_profile_and_update_ui(self, pname, source="dropdown"):
         conf_profiles = self.conf.get("profiles", {})
@@ -626,7 +694,7 @@ Kreator: Nele
             cmd = ["liquidctl", "-m", self.selected_device["description"], "initialize"]
             subprocess.run(cmd, capture_output=True, text=True, check=True)
         except Exception as e:
-            logger.error(f"Failed to initialize: {e}")
+            self.show_status_message(f"Failed to initialize device: {e}")
 
     def update_status(self):
         if not self.selected_device:
@@ -640,12 +708,12 @@ Kreator: Nele
             except Exception:
                 self.parse_text_status(result.stdout)
         except Exception as e:
-            logger.error(f"Error in update_status: {e}")
+            self.show_status_message(f"Error updating status: {e}")
         cpu_temp = get_cpu_temp()
         if cpu_temp is not None:
-            self.cpu_temp_label.setText(f"CPU temperatura: {cpu_temp:.1f} °C")
+            self.cpu_temp_label.setText(f"CPU Temperature: {cpu_temp:.1f} °C")
         else:
-            self.cpu_temp_label.setText("CPU temperatura: N/A")
+            self.cpu_temp_label.setText("CPU Temperature: N/A")
 
     def parse_json_status(self, status_data):
         if not status_data or not isinstance(status_data, list) or "status" not in status_data[0]:
@@ -725,7 +793,7 @@ Kreator: Nele
                 self.select_device(0)
                 self.initialize_device()
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            self.show_status_message(f"Failed to load devices: {e}")
 
     def select_device(self, index):
         if 0 <= index < len(self.devices):
@@ -736,7 +804,7 @@ Kreator: Nele
             self.initialize_device()
 
     def detect_fan_count(self):
-        # AUTO-DETECT! Ovdje je prava magija :)
+        # AUTO-DETECT! Here is the real magic :)
         if not self.selected_device:
             self.fan_count = 0
             return
@@ -753,11 +821,11 @@ Kreator: Nele
             self.fan_count = count
             logger.debug(f"Detected {self.fan_count} fans!")
         except Exception as e:
-            logger.error(f"Error detecting fan count: {str(e)}")
+            self.show_status_message(f"Error detecting fan count: {e}")
             self.fan_count = 6
         font = QFont()
         font.setPointSize(16)
-        # kontrol panel
+        # control panel
         self.add_fan_controls(self.fan_count, font)
         # status panel
         for l in getattr(self, "fan_status_labels", []):
@@ -769,7 +837,7 @@ Kreator: Nele
             label.setFont(font)
             self.fan_status_layout.addWidget(label)
             self.fan_status_labels.append(label)
-        self.main_widget.adjustSize()  # Za svaki slučaj
+        self.main_widget.adjustSize()
 
     def update_fan_ui(self):
         pass
@@ -808,7 +876,7 @@ Kreator: Nele
                     subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
                     logger.debug(f"Fan {fan_id} set to {speed_percent}% ({' '.join(cmd)})")
                 except Exception as e:
-                    logger.error(f"Fan {fan_id} speed command failed: {e}")
+                    self.show_status_message(f"Failed to set fan {fan_id} speed: {e}")
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
@@ -836,7 +904,7 @@ Kreator: Nele
                 subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
                 logger.debug(f"Pump set to {speed_percent}% ({' '.join(cmd)})")
             except Exception as e:
-                logger.error(f"Pump speed command failed: {e}")
+                self.show_status_message(f"Failed to set pump speed: {e}")
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
@@ -874,9 +942,6 @@ Kreator: Nele
         return int(round(percent / 10) * 10)
 
 def main():
-    if not shutil.which("liquidctl"):
-        QMessageBox.critical(None, "Greška", "liquidctl nije instaliran! Instaliraj ga sa: pip install liquidctl")
-        sys.exit(1)
     app = QApplication(sys.argv)
     icon_paths = [
         os.path.join(os.path.dirname(__file__), "icon.png"),
