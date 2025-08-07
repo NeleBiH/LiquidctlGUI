@@ -18,7 +18,9 @@ from PyQt6.QtGui import QIcon, QAction, QFont
 from PyQt6.QtCore import Qt, QTimer
 
 HOME = os.path.expanduser("~")
-CONFIG_PATH = os.path.join(HOME, ".LIquidctl_settings.json")
+# Use a consistently lowercase configuration file name so that settings are
+# stored and reloaded from the expected path on case-sensitive filesystems.
+CONFIG_PATH = os.path.join(HOME, ".liquidctl_settings.json")
 
 if not shutil.which("liquidctl"):
     app = QApplication(sys.argv)
@@ -742,7 +744,27 @@ Creator: Nele
         self.update_ui_with_status(fan_speeds, pump_speed, water_temp)
 
     def parse_text_status(self, output):
-        pass
+        fan_speeds = {}
+        pump_speed = None
+        water_temp = None
+        for line in output.splitlines():
+            m = re.search(r"fan\s*(\d+)\s*speed.*?(\d+)\s*rpm", line, re.IGNORECASE)
+            if m:
+                fan_num = m.group(1)
+                rpm = int(m.group(2))
+                percent = self.rpm_to_percent(rpm)
+                fan_speeds[f"Fan {fan_num}"] = (percent, rpm)
+                continue
+            m = re.search(r"pump\s*speed.*?(\d+)\s*rpm", line, re.IGNORECASE)
+            if m:
+                rpm = int(m.group(1))
+                percent = self.rpm_to_percent(rpm, is_pump=True)
+                pump_speed = (percent, rpm)
+                continue
+            m = re.search(r"water\s*temperature.*?([\d.]+)", line, re.IGNORECASE)
+            if m:
+                water_temp = float(m.group(1))
+        self.update_ui_with_status(fan_speeds, pump_speed, water_temp)
 
     def update_ui_with_status(self, fan_speeds, pump_speed, water_temp):
         now = time.time()
