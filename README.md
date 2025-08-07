@@ -1,59 +1,114 @@
 # LiquidctlGUI
-LiquidctlGUI is attempt of creating simple interface for liquidctl (https://github.com/liquidctl/liquidctl) using AI 
-because i am not coder and your cat might be set on fire if you run this code so no any promises😉
+
+<img width="1916" height="1034" alt="Screenshot_20250808_011612" src="https://github.com/user-attachments/assets/4b7d3ca1-bc3b-4a39-b2e2-302390824e9f" />
+
+
+A simple GUI for [liquidctl](https://github.com/liquidctl/liquidctl) to control **fans** and **pump** on devices such as the Corsair Commander Core.  
+I am not a programmer – this was **built with AI assistance** – use at your own risk. If your cat catches fire, it’s on you. 😉
+
+---
+
+## 📌 Features
+
+- **List devices** detected by `liquidctl`
+- **Status**: fan RPM, pump RPM, number of connected fans, water temperature
+- **Speed control**: per-fan control and separate pump control
+- **Profiles**: create, edit, delete + **Save Current Profile** (stores the current slider positions)
+- **Clean UI**: one line per fan → **Name | RPM | % | Slider**
+- **System Info**: OS/distro, CPU model, GPU model, RAM and disk (root) usage
+
+
+    How It Works
+  --------------------------------------------------------------------------------------------
+
+    GUI built in PyQt6
+
+    All status/set commands are executed via liquidctl CLI (subprocess)
+
+    CPU model is read from lscpu (with LC_ALL=C), fallback /proc/cpuinfo
+
+    GPU: first tries nvidia-smi, then falls back to lspci | grep VGA
+
+    Temperatures: read from lm-sensors and optionally nvidia-smi
+
+    Profiles are saved in: ~/.LIquidctl_settings.json
+
+  🖱 Usage
+
+    Sliders: moving a slider instantly updates the % and estimated RPM in the UI; actual RPM is confirmed on the next refresh
+
+    Save Current Profile: store the current fan/pump % values as a new profile
+
+    Profiles: select, load, and manage profiles from the dropdown menu
 
 
 
-You have to have liquidctl installed search it trough your package manager or install it via terminal using pip
+---
+
+## ⚠ Current Limitations
+
+- **RGB control**: currently **not working** (on my H170 the RGB status is broken in liquidctl; lights may blink when adjusting speeds)
+- Fan/Pump speeds update on a **refresh interval**; physical RPM may take a few seconds to stabilize – normal controller behavior
+- Supported devices depend entirely on what `liquidctl` supports
+
+---
+
+## 📦 Requirements
+
+- Linux, Python 3.8+
+- `liquidctl`, `pyqt6`
+- For temperatures and system info:
+  - `lm-sensors` + `sensors-detect`
+  - `pciutils` (for `lspci`)
+  - (optional) NVIDIA `nvidia-smi` for nicer GPU names
+
+---
+
+## 🔧 Installation
+
+Ubuntu / Debian
+-------------------------------------------------------------
+
+sudo apt update
+sudo apt install -y python3 python3-pip pciutils lm-sensors
+pip3 install --user liquidctl pyqt6
+sudo sensors-detect --auto
+
+Fedora
+----------------------------------------------------------------
+sudo dnf -y update
+sudo dnf install -y python3 python3-pip pciutils lm_sensors
+pip3 install --user liquidctl pyqt6
+sudo sensors-detect --auto
+
+I use Arch btw people
+-----------------------------------------------------------------------------
+sudo pacman -Syu --noconfirm
+sudo pacman -S --noconfirm python python-pip pciutils lm_sensors
+pip3 install --user liquidctl pyqt6
+sudo sensors-detect --auto Running Without sudo (udev Rule)
 
 
-sudo apt update  /  sudo yum update  /  sudo dnfupdate
 
-
-sudo apt or yum or dnf install python3 python3-pip
-
-
-pip3 install liquidctl
-
-
-pip3 install pyqt6
-
-<img width="804" height="526" alt="1" src="https://github.com/user-attachments/assets/813ab3e3-97fa-4a2e-8c29-0fb380bff942" />
-<img width="799" height="516" alt="Screenshot_20250717_232045" src="https://github.com/user-attachments/assets/cc34e465-027c-4783-a83d-39fd44eb69e6" />
-
-
-So what works and what not(atleast on my system)
-----------------------------------------------------------------------------------
-
--list devices  --it lists devices installed in your pc supported by liquidctl
-
--get status     --fan speeds,pump speeds,number of fans and water temp
-
--setting fan speed   --sets all fan speed to a given slider position
-
--setting pump speed  --sets pump speed to a given slider position
-
--profiles work partialy i need to change to save them into some config in home folder
+If liquidctl gives “Permission denied”, add a udev rule.
+Example (Corsair Commander Core – vendor 1b1c, product 0c0a; check with lsusb):
 
 
 
-What it doesnt work or it is bugged
----------------------------------------------------------------------------------
-
--rgb control is curently unsupported on my system using crosair H170 water cooling it has broken status on liquidctl 
-(rgb lights sometimes blink when setting fan and pump speed,why idk)
+cat << 'EOF' | sudo tee /etc/udev/rules.d/99-liquidctl.rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="1b1c", ATTR{idProduct}=="0c0a", MODE="0666", GROUP="plugdev"
+EOF
 
 
-What i would like to add
---------------------------------------
--program icon
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 
--actuall working rgb control 
 
--language support curently everything is mixed betwen croatian and englsih
+▶ Running the App
 
--settings to save or load saved user settings
-
+git clone https://github.com/<your-user>/<your-repo>.git
+cd <your-repo>
+python3 LiquidctlGUI.py
 
 
 
