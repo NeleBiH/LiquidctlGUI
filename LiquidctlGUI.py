@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QGroupBox, QComboBox,
     QSystemTrayIcon, QMenu, QMessageBox, QDialog,
-    QFormLayout, QDialogButtonBox, QLineEdit, QInputDialog, QStyle, QSpacerItem, QSizePolicy, QStatusBar
+    QFormLayout, QDialogButtonBox, QLineEdit, QInputDialog, QStyle, QSizePolicy, QStatusBar
 )
 from PyQt6.QtGui import QIcon, QAction, QFont
 from PyQt6.QtCore import Qt, QTimer
@@ -139,28 +139,108 @@ def save_json_config(conf):
     except Exception as e:
         logger.error(f"Failed to save config: {e}")
 
+# CPU temp — pokušava najčešće pattern-e
 def get_cpu_temp():
     try:
         out = subprocess.run(['sensors'], capture_output=True, text=True)
-        temp = None
         for line in out.stdout.splitlines():
-            m = re.search(r'Package id \d+:\s*\+([\d.]+)', line)
+            # Intel: Package id 0, Core 0, Core 1, AMD: Tctl, k10temp
+            m = re.search(r'(Package id \d+|Tctl|Core \d+|k10temp|CPU Temperature|Physical id \d+):\s*\+?([\d.]+)', line)
             if m:
-                temp = float(m.group(1))
-                break
-        if temp is None:
-            for line in out.stdout.splitlines():
-                m = re.search(r'Core \d+:\s*\+([\d.]+)', line)
-                if m:
-                    temp = float(m.group(1))
-                    break
-        return temp
+                return float(m.group(2))
+            # fallback za temp1, temp2 ali bez GPU
+            m2 = re.search(r'temp\d+:\s*\+?([\d.]+)', line)
+            if m2:
+                return float(m2.group(1))
     except Exception as e:
         logger.error(f"CPU temp error: {e}")
-        return None
+    return None
+
+# GPU temp — nvidia-smi i sensors fallback
+def get_gpu_temp():
+    # Nvidia
+    try:
+        out = subprocess.run(
+            ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=3
+        )
+        lines = out.stdout.strip().splitlines()
+        for l in lines:
+            try:
+                temp = float(l.strip())
+                if temp > 0:
+                    return temp
+            except:
+                continue
+    except Exception:
+        pass
+    # AMD/Intel sensors
+    try:
+        out = subprocess.run(['sensors'], capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            # AMD: edge, junction, temp1/2
+            m = re.search(r'(edge|junction):\s*\+?([\d.]+)', line, re.I)
+            if m:
+                return float(m.group(2))
+            # Intel: temp1, GPU Temp, itd.
+            m2 = re.search(r'(GPU.*Temp|temp\d+):\s*\+?([\d.]+)', line, re.I)
+            if m2 and float(m2.group(2)) < 120:  # GPU temp obično ispod 100C, CPU često gore
+                return float(m2.group(2))
+    except Exception:
+        pass
+    return None
 
 if not check_device_access():
     run_with_sudo()
+
+fan_slider_style = """
+QSlider::groove:horizontal {
+    border: 1px solid #999999;
+    height: 8px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #B1B1B1, stop:1 #c4c4c4);
+    margin: 2px 0;
+}
+QSlider::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #b4b4b4, stop:1 #0080ff);
+    border: 1px solid #313755;
+    width: 30px;
+    margin: -2px 0;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0099FF, stop:1 #0067B1);
+}
+QSlider::tick-mark:horizontal {
+    background: #ffffff;
+    height: 2px;
+    width: 2px;
+    margin: 0px 0;
+}
+"""
+pump_slider_style = """
+QSlider::groove:horizontal {
+    border: 1px solid #999999;
+    height: 8px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #B1B1B1, stop:1 #c4c4c4);
+    margin: 2px 0;
+}
+QSlider::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #b4b4b4, stop:1 #8f8f8f);
+    border: 1px solid #5c5c5c;
+    width: 30px;
+    margin: -2px 0;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #800080, stop:1 #BA55D3);
+}
+QSlider::tick-mark:horizontal {
+    background: #ffffff;
+    height: 2px;
+    width: 2px;
+    margin: 0px 0;
+}
+"""
 
 class ProfileDialog(QDialog):
     def __init__(self, parent=None, existing_name="", fan_speeds=None, pump_speed=0, fan_count=6):
@@ -187,6 +267,7 @@ class ProfileDialog(QDialog):
             slider.setTickPosition(QSlider.TickPosition.TicksBelow)
             slider.setMinimumHeight(48)
             slider.setValue(fan_speeds[i] if fan_speeds else 0)
+            slider.setStyleSheet(fan_slider_style)
             slider.valueChanged.connect(lambda value, idx=i: self.update_fan_speed_label(idx))
             layout.addRow(label)
             layout.addWidget(slider)
@@ -202,6 +283,7 @@ class ProfileDialog(QDialog):
         self.pump_speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.pump_speed_slider.setMinimumHeight(48)
         self.pump_speed_slider.setValue(pump_speed)
+        self.pump_speed_slider.setStyleSheet(pump_slider_style)
         self.pump_speed_slider.valueChanged.connect(self.update_pump_speed_label)
         layout.addRow(self.pump_speed_label)
         layout.addWidget(self.pump_speed_slider)
@@ -292,7 +374,7 @@ class LiquidCtlGUI(QMainWindow):
         if not shutil.which("sensors"):
             reply = QMessageBox.question(
                 self, 'lm-sensors not found',
-                'The `sensors` command is not found. This is required to display CPU temperature.\n'
+                'The `sensors` command is not found. This is required to display CPU/GPU temperature.\n'
                 'Do you want to automatically install `lm-sensors`?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
@@ -381,35 +463,10 @@ class LiquidCtlGUI(QMainWindow):
         self.pump_slider.setSingleStep(10)
         self.pump_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.pump_slider.setMinimumHeight(48)
-        self.pump_slider.valueChanged.connect(self.adjust_pump_speed)
-        pump_slider_style = """
-QSlider::groove:horizontal {
-    border: 1px solid #999999;
-    height: 8px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #B1B1B1, stop:1 #c4c4c4);
-    margin: 2px 0;
-}
-QSlider::handle:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #b4b4b4, stop:1 #8f8f8f);
-    border: 1px solid #5c5c5c;
-    width: 30px;
-    margin: -2px 0;
-    border-radius: 3px;
-}
-QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #800080, stop:1 #BA55D3);
-}
-QSlider::tick-mark:horizontal {
-    background: #ffffff;
-    height: 2px;
-    width: 2px;
-    margin: 0px 0;
-}
-"""
         self.pump_slider.setStyleSheet(pump_slider_style)
+        self.pump_slider.valueChanged.connect(self.adjust_pump_speed)
         self.control_layout.addWidget(self.pump_label)
         self.control_layout.addWidget(self.pump_slider)
-        # Dynamically populate fan control
         self.fan_labels = []
         self.fan_sliders = []
         self.fan_status_labels = []
@@ -441,6 +498,9 @@ QSlider::tick-mark:horizontal {
         self.cpu_temp_label = QLabel("CPU Temperature: N/A")
         self.cpu_temp_label.setFont(font)
         pump_temp_layout.addWidget(self.cpu_temp_label)
+        self.gpu_temp_label = QLabel("GPU Temperature: N/A")
+        self.gpu_temp_label.setFont(font)
+        pump_temp_layout.addWidget(self.gpu_temp_label)
         self.pump_temp_group.setLayout(pump_temp_layout)
         status_layout.addWidget(self.pump_temp_group)
         main_layout.addLayout(status_layout)
@@ -461,31 +521,6 @@ QSlider::tick-mark:horizontal {
             s.deleteLater()
         self.fan_labels = []
         self.fan_sliders = []
-        # Add new
-        fan_slider_style = """
-QSlider::groove:horizontal {
-    border: 1px solid #999999;
-    height: 8px;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #B1B1B1, stop:1 #c4c4c4);
-    margin: 2px 0;
-}
-QSlider::handle:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #b4b4b4, stop:1 #0080ff);
-    border: 1px solid #313755;
-    width: 30px;
-    margin: -2px 0;
-    border-radius: 3px;
-}
-QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0099FF, stop:1 #0067B1);
-}
-QSlider::tick-mark:horizontal {
-    background: #ffffff;
-    height: 2px;
-    width: 2px;
-    margin: 0px 0;
-}
-"""
         for i in range(count):
             label = QLabel(f"Fan {i+1} Speed: N/A")
             label.setFont(font)
@@ -502,17 +537,6 @@ QSlider::tick-mark:horizontal {
             self.control_layout.addWidget(slider)
             self.fan_labels.append(label)
             self.fan_sliders.append(slider)
-
-    def add_fan_status_labels(self, count, font):
-        for l in getattr(self, "fan_status_labels", []):
-            self.fan_status_layout.removeWidget(l)
-            l.deleteLater()
-        self.fan_status_labels = []
-        for i in range(count):
-            label = QLabel(f"Fan {i+1}: N/A")
-            label.setFont(font)
-            self.fan_status_layout.addWidget(label)
-            self.fan_status_labels.append(label)
 
     def save_sliders_to_conf(self):
         fan_speeds = [s.value() for s in self.fan_sliders]
@@ -682,41 +706,43 @@ Creator: Nele
             s.blockSignals(block)
         self.pump_slider.blockSignals(block)
 
-    def update_tray_menu(self, fan_speeds, pump_speed, water_temp):
-        self.fan_speeds = fan_speeds
-        self.pump_speed = pump_speed
-        self.water_temp = water_temp
-
-    def initialize_device(self):
-        if not self.selected_device:
-            return
-        try:
-            cmd = ["liquidctl", "-m", self.selected_device["description"], "initialize"]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-        except Exception as e:
-            self.show_status_message(f"Failed to initialize device: {e}")
+    def update_tray_tooltip(self):
+        tooltip_lines = []
+        tooltip_lines.append(self.temp_label.text())
+        tooltip_lines.append(self.cpu_temp_label.text())
+        tooltip_lines.append(self.gpu_temp_label.text())
+        for i, lbl in enumerate(self.fan_status_labels):
+            tooltip_lines.append(lbl.text())
+        tooltip_lines.append(self.pump_speed_label.text())
+        self.tray_icon.setToolTip('\n'.join(tooltip_lines))
 
     def update_status(self):
         if not self.selected_device:
             return
         try:
             cmd = ["liquidctl", "-m", self.selected_device["description"], "status", "--json"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
             try:
-                result.check_returncode()
                 data = json.loads(result.stdout)
                 self.parse_json_status(data)
-            except (json.JSONDecodeError, subprocess.CalledProcessError):
-                cmd = ["liquidctl", "-m", self.selected_device["description"], "status"]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
+            except Exception:
                 self.parse_text_status(result.stdout)
         except Exception as e:
             self.show_status_message(f"Error updating status: {e}")
+
         cpu_temp = get_cpu_temp()
         if cpu_temp is not None:
             self.cpu_temp_label.setText(f"CPU Temperature: {cpu_temp:.1f} °C")
         else:
             self.cpu_temp_label.setText("CPU Temperature: N/A")
+
+        gpu_temp = get_gpu_temp()
+        if gpu_temp is not None:
+            self.gpu_temp_label.setText(f"GPU Temperature: {gpu_temp:.1f} °C")
+        else:
+            self.gpu_temp_label.setText("GPU Temperature: N/A")
+
+        self.update_tray_tooltip()
 
     def parse_json_status(self, status_data):
         if not status_data or not isinstance(status_data, list) or "status" not in status_data[0]:
@@ -729,8 +755,8 @@ Creator: Nele
         for item in device_status:
             key = item.get("key", "").lower()
             value = item.get("value", 0)
-            if "fan" in key and "speed" in key:
-                m = re.search(r"fan (\d+) speed", key)
+            if "fan speed" in key:
+                m = re.search(r"fan speed (\d+)", key)
                 if m:
                     fan_num = m.group(1)
                     rpm = int(value) if isinstance(value, (int, float)) else 0
@@ -745,28 +771,8 @@ Creator: Nele
         self.update_ui_with_status(fan_speeds, pump_speed, water_temp)
 
     def parse_text_status(self, output):
-        fan_speeds = {}
-        pump_speed = None
-        water_temp = None
-        for line in output.splitlines():
-            lower = line.strip().lower()
-            m = re.search(r"fan (\d+) speed[:\s]+(\d+)", lower)
-            if m:
-                fan_num = m.group(1)
-                rpm = int(m.group(2))
-                percent = self.rpm_to_percent(rpm)
-                fan_speeds[f"Fan {fan_num}"] = (percent, rpm)
-                continue
-            m = re.search(r"pump speed[:\s]+(\d+)", lower)
-            if m:
-                rpm = int(m.group(1))
-                percent = self.rpm_to_percent(rpm, is_pump=True)
-                pump_speed = (percent, rpm)
-                continue
-            m = re.search(r"(liquid|water) temperature[:\s]+([\d\.]+)", lower)
-            if m:
-                water_temp = float(m.group(2))
-        self.update_ui_with_status(fan_speeds, pump_speed, water_temp)
+        # fallback, not needed for most devices
+        pass
 
     def update_ui_with_status(self, fan_speeds, pump_speed, water_temp):
         now = time.time()
@@ -803,7 +809,7 @@ Creator: Nele
         else:
             self.temp_label.setText("Water Temperature: N/A")
         self.save_sliders_to_conf()
-        self.update_tray_menu(fan_speeds, pump_speed, water_temp)
+        self.update_tray_tooltip()
 
     def load_devices(self):
         try:
@@ -823,12 +829,19 @@ Creator: Nele
         if 0 <= index < len(self.devices):
             self.selected_device = self.device_combo.itemData(index)
             self.detect_fan_count()
-            self.update_controls()
             self.update_status()
             self.initialize_device()
 
+    def initialize_device(self):
+        if not self.selected_device:
+            return
+        try:
+            cmd = ["liquidctl", "-m", self.selected_device["description"], "initialize"]
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except Exception as e:
+            self.show_status_message(f"Failed to initialize device: {e}")
+
     def detect_fan_count(self):
-        # AUTO-DETECT! Here is the real magic :)
         if not self.selected_device:
             self.fan_count = 0
             return
@@ -849,9 +862,7 @@ Creator: Nele
             self.fan_count = 6
         font = QFont()
         font.setPointSize(16)
-        # control panel
         self.add_fan_controls(self.fan_count, font)
-        # status panel
         for l in getattr(self, "fan_status_labels", []):
             self.fan_status_layout.removeWidget(l)
             l.deleteLater()
@@ -862,9 +873,6 @@ Creator: Nele
             self.fan_status_layout.addWidget(label)
             self.fan_status_labels.append(label)
         self.main_widget.adjustSize()
-
-    def update_fan_ui(self):
-        pass
 
     def update_controls(self):
         dev = self.selected_device
