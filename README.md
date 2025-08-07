@@ -68,47 +68,48 @@ I am not a programmer – this was **built with AI assistance** – use at your 
 
 Ubuntu / Debian
 -------------------------------------------------------------
-
-sudo apt update
-sudo apt install -y python3 python3-pip pciutils lm-sensors
-pip3 install --user liquidctl pyqt6
-sudo sensors-detect --auto
+-  sudo apt update
+-  sudo apt install -y python3 python3-pip pciutils lm-sensors
+-  pip3 install --user liquidctl pyqt6
+-  sudo sensors-detect --auto
 
 Fedora
 ----------------------------------------------------------------
-sudo dnf -y update
-sudo dnf install -y python3 python3-pip pciutils lm_sensors
-pip3 install --user liquidctl pyqt6
-sudo sensors-detect --auto
+-  sudo dnf -y update
+-  sudo dnf install -y python3 python3-pip pciutils lm_sensors
+-  pip3 install --user liquidctl pyqt6
+-  sudo sensors-detect --auto
 
 I use Arch btw people
 -----------------------------------------------------------------------------
-sudo pacman -Syu --noconfirm
-sudo pacman -S --noconfirm python python-pip pciutils lm_sensors
-pip3 install --user liquidctl pyqt6
-sudo sensors-detect --auto Running Without sudo (udev Rule)
-
-
-
-If liquidctl gives “Permission denied”, add a udev rule.
-Example (Corsair Commander Core – vendor 1b1c, product 0c0a; check with lsusb):
-
-
-
-cat << 'EOF' | sudo tee /etc/udev/rules.d/99-liquidctl.rules
-SUBSYSTEM=="usb", ATTR{idVendor}=="1b1c", ATTR{idProduct}=="0c0a", MODE="0666", GROUP="plugdev"
-EOF
-
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-
+-  sudo pacman -Syu --noconfirm
+-  sudo pacman -S --noconfirm python python-pip pciutils lm_sensors
+-  pip3 install --user liquidctl pyqt6
+-  sudo sensors-detect --auto Running Without sudo (udev Rule)
 
 ▶ Running the App
 
-git clone https://github.com/<your-user>/<your-repo>.git
-cd <your-repo>
-python3 LiquidctlGUI.py
+-  git clone https://github.com/<your-user>/<your-repo>.git
+-  cd <your-repo>
+-  python3 LiquidctlGUI.py
+
+
+
+*📅 Roadmap
+----------------------------------------------------------
+-   fix CPU model detection 
+
+-   App icon
+
+-   RGB control (when/if liquidctl supports it properly)
+
+-    Master slider (All Fans) and fan grouping
+
+-    Safety limit (force minimum % above X °C water temp)
+
+-    Rename fans
+
+-    Export/Import profiles**
 
 
 
