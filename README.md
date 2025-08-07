@@ -16,6 +16,7 @@ I am not a programmer – this was **built with AI assistance** – use at your 
 - **Profiles**: create, edit, delete + **Save Current Profile** (stores the current slider positions)
 - **Clean UI**: one line per fan → **Name | RPM | % | Slider**
 - **System Info**: OS/distro, CPU model, GPU model, RAM and disk (root) usage
+- **Tray icon with** profile selection and popup with temps and fan/pump speeds
 
 
     How It Works
@@ -66,21 +67,21 @@ I am not a programmer – this was **built with AI assistance** – use at your 
 
 ## 🔧 Installation
 
-Ubuntu / Debian
+**Ubuntu / Debian**
 -------------------------------------------------------------
 -  sudo apt update
 -  sudo apt install -y python3 python3-pip pciutils lm-sensors
 -  pip3 install --user liquidctl pyqt6
 -  sudo sensors-detect --auto
 
-Fedora
+**Fedora**
 ----------------------------------------------------------------
 -  sudo dnf -y update
 -  sudo dnf install -y python3 python3-pip pciutils lm_sensors
 -  pip3 install --user liquidctl pyqt6
 -  sudo sensors-detect --auto
 
-I use Arch btw people
+**I use Arch btw people**
 -----------------------------------------------------------------------------
 -  sudo pacman -Syu --noconfirm
 -  sudo pacman -S --noconfirm python python-pip pciutils lm_sensors
