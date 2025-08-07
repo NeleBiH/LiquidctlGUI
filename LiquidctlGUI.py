@@ -701,11 +701,14 @@ Creator: Nele
             return
         try:
             cmd = ["liquidctl", "-m", self.selected_device["description"], "status", "--json"]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             try:
+                result.check_returncode()
                 data = json.loads(result.stdout)
                 self.parse_json_status(data)
-            except Exception:
+            except (json.JSONDecodeError, subprocess.CalledProcessError):
+                cmd = ["liquidctl", "-m", self.selected_device["description"], "status"]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
                 self.parse_text_status(result.stdout)
         except Exception as e:
             self.show_status_message(f"Error updating status: {e}")
@@ -726,8 +729,8 @@ Creator: Nele
         for item in device_status:
             key = item.get("key", "").lower()
             value = item.get("value", 0)
-            if "fan speed" in key:
-                m = re.search(r"fan speed (\d+)", key)
+            if "fan" in key and "speed" in key:
+                m = re.search(r"fan (\d+) speed", key)
                 if m:
                     fan_num = m.group(1)
                     rpm = int(value) if isinstance(value, (int, float)) else 0
@@ -742,7 +745,28 @@ Creator: Nele
         self.update_ui_with_status(fan_speeds, pump_speed, water_temp)
 
     def parse_text_status(self, output):
-        pass
+        fan_speeds = {}
+        pump_speed = None
+        water_temp = None
+        for line in output.splitlines():
+            lower = line.strip().lower()
+            m = re.search(r"fan (\d+) speed[:\s]+(\d+)", lower)
+            if m:
+                fan_num = m.group(1)
+                rpm = int(m.group(2))
+                percent = self.rpm_to_percent(rpm)
+                fan_speeds[f"Fan {fan_num}"] = (percent, rpm)
+                continue
+            m = re.search(r"pump speed[:\s]+(\d+)", lower)
+            if m:
+                rpm = int(m.group(1))
+                percent = self.rpm_to_percent(rpm, is_pump=True)
+                pump_speed = (percent, rpm)
+                continue
+            m = re.search(r"(liquid|water) temperature[:\s]+([\d\.]+)", lower)
+            if m:
+                water_temp = float(m.group(2))
+        self.update_ui_with_status(fan_speeds, pump_speed, water_temp)
 
     def update_ui_with_status(self, fan_speeds, pump_speed, water_temp):
         now = time.time()
