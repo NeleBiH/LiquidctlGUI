@@ -1,6 +1,7 @@
 # LiquidctlGUI
 
-<img width="1916" height="1034" alt="Screenshot_20250808_011612" src="https://github.com/user-attachments/assets/4b7d3ca1-bc3b-4a39-b2e2-302390824e9f" />
+<img width="1916" height="1038" alt="Screenshot_20250808_204023" src="https://github.com/user-attachments/assets/d67cde9d-b9ba-4dbd-a7ef-5cb1ed0cbab4" />
+
 
 
 A simple GUI for [liquidctl](https://github.com/liquidctl/liquidctl) to control **fans** and **pump** on devices such as the Corsair Commander Core.  
