@@ -37,6 +37,33 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QIcon, QAction, QFont
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
+# Try to import the liquidctl Python library.  If available we can talk
+# directly to supported devices instead of spawning the external
+# `liquidctl` command.  This improves performance and avoids the need
+# for a separate CLI installation.  If the import fails we silently
+# fall back to invoking the command line tool.
+HAVE_LIQUIDCTL_LIB = False
+try:
+    import liquidctl  # type: ignore
+    from liquidctl import find_liquidctl_devices  # type: ignore
+    HAVE_LIQUIDCTL_LIB = True
+except Exception:
+    # Attempt to load a local copy of the library from a sibling
+    # directory (e.g. when running from an extracted release).
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        here = os.getcwd()
+    local_lib = os.path.join(here, "liquidctl-main")
+    if os.path.isdir(os.path.join(local_lib, "liquidctl")):
+        sys.path.insert(0, local_lib)
+        try:
+            import liquidctl  # type: ignore
+            from liquidctl import find_liquidctl_devices  # type: ignore
+            HAVE_LIQUIDCTL_LIB = True
+        except Exception:
+            HAVE_LIQUIDCTL_LIB = False
+
 # ====== Adaptive UI defaults; shrinks on 1080p in _apply_compact_if_needed ======
 FONT_PT   = 13
 BTN_H     = 36
@@ -365,6 +392,13 @@ class LiquidCtlGUI(QMainWindow):
         self.min_fan_rpm, self.max_fan_rpm = 200, 2000
         self.min_pump_rpm, self.max_pump_rpm = 1000, 2700
         self._last_water_temp = None
+
+        # Determine if we should use the Python library or fall back to the CLI.
+        # When HAVE_LIQUIDCTL_LIB is true we can talk to devices directly via
+        # the liquidctl API; otherwise we spawn the `liquidctl` command as
+        # before.  Storing this in an instance variable allows other methods
+        # to conditionally branch without repeatedly checking the global.
+        self.use_cli = not HAVE_LIQUIDCTL_LIB
 
         # Rename state
         self.fan_name_edits = {}
@@ -778,25 +812,54 @@ class LiquidCtlGUI(QMainWindow):
     # ---------- Device / permissions ----------
     def safe_refresh_devices(self, select_first=False):
         prev_desc = self.selected_device["description"] if self.selected_device else None
-        try:
-            r = self.run_logged(["liquidctl","list","--json"], timeout=6)
-            new_list = json.loads(r.stdout) if r.stdout else []
-        except Exception as e:
-            self.show_status_message(f"Refresh failed: {e}")
-            return
-        if not new_list:
-            self.show_status_message("No devices found."); return
-
+        # When using the Python library we query connected devices directly; otherwise we
+        # fall back to invoking the liquidctl CLI.  The resulting list of
+        # dictionaries always contains at least a human readable description and,
+        # for the library case, a reference to the driver instance under the
+        # ``device`` key.
+        if not self.use_cli:
+            try:
+                devices = list(find_liquidctl_devices())
+            except Exception as e:
+                self.show_status_message(f"Refresh failed: {e}")
+                return
+            if not devices:
+                self.show_status_message("No devices found."); return
+            new_list = []
+            for dev in devices:
+                try:
+                    desc = getattr(dev, 'description', 'Unknown Device')
+                except Exception:
+                    desc = 'Unknown Device'
+                entry = {
+                    'description': desc,
+                    'vendor_id': getattr(dev, 'vendor_id', None),
+                    'product_id': getattr(dev, 'product_id', None),
+                    'device': dev
+                }
+                new_list.append(entry)
+        else:
+            try:
+                r = self.run_logged(["liquidctl","list","--json"], timeout=6)
+                new_list = json.loads(r.stdout) if r.stdout else []
+            except Exception as e:
+                self.show_status_message(f"Refresh failed: {e}")
+                return
+            if not new_list:
+                self.show_status_message("No devices found."); return
+        # Populate the combo box and preserve the previously selected device if possible
         self.devices = new_list
-        self.device_combo.blockSignals(True); self.device_combo.clear()
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
         keep_idx = 0
         for i, dev in enumerate(self.devices):
             desc = dev.get("description","Unknown Device")
             self.device_combo.addItem(desc, dev)
-            if prev_desc and desc == prev_desc: keep_idx = i
+            if prev_desc and desc == prev_desc:
+                keep_idx = i
         self.device_combo.blockSignals(False)
-
-        if select_first: self.select_device(0)
+        if select_first:
+            self.select_device(0)
         else:
             self.device_combo.setCurrentIndex(keep_idx)
             self.select_device(keep_idx)
@@ -809,11 +872,29 @@ class LiquidCtlGUI(QMainWindow):
             self.update_status()
 
     def initialize_device(self):
-        if not self.selected_device: return
-        try:
-            self.run_logged(["liquidctl","-m", self.selected_device["description"], "initialize"], timeout=8)
-        except Exception as e:
-            self.show_status_message(f"Failed to initialize device: {e}")
+        if not self.selected_device:
+            return
+        # For library-backed devices we initialize via the API; otherwise we
+        # fall back to the CLI.  Always probe for pump capability afterwards.
+        if self.use_cli:
+            try:
+                self.run_logged(["liquidctl","-m", self.selected_device["description"], "initialize"], timeout=8)
+            except Exception as e:
+                self.show_status_message(f"Failed to initialize device: {e}")
+        else:
+            dev = self.selected_device.get("device")
+            if dev is None:
+                return
+            try:
+                # Connect and initialize the device.  The context manager
+                # ensures disconnect() is called even if initialization
+                # fails.
+                with dev.connect():
+                    # Some drivers return additional status information; we
+                    # intentionally ignore the return value here.
+                    dev.initialize()
+            except Exception as e:
+                self.show_status_message(f"Failed to initialize device: {e}")
         self.probe_pump_capability()
 
     def install_udev_rule_for_selected(self):
@@ -841,23 +922,50 @@ class LiquidCtlGUI(QMainWindow):
                     yield it
 
     def detect_features_from_status(self):
-        self.fan_count = 0; self.have_pump = False
-        if not self.selected_device: return
-        try:
-            res = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status","--json"], timeout=8)
-            status_data = json.loads(res.stdout) if res.stdout else []
-            max_fan_idx = 0
-            for it in self._iter_status_entries(status_data):
-                k = (it.get("key","") or "").lower()
-                if k.startswith("fan speed"):
-                    m = re.search(r'fan speed\s+(\d+)', k)
-                    if m: max_fan_idx = max(max_fan_idx, int(m.group(1)))
-                elif k.startswith("pump speed"):
-                    self.have_pump = True
-            self.fan_count = max_fan_idx or 6
-        except Exception as e:
-            self.show_status_message(f"Error detecting features: {e}")
-            self.fan_count = 6
+        # Reset feature flags before probing.
+        self.fan_count = 0
+        self.have_pump = False
+        if not self.selected_device:
+            return
+        if self.use_cli:
+            try:
+                res = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status","--json"], timeout=8)
+                status_data = json.loads(res.stdout) if res.stdout else []
+                max_fan_idx = 0
+                for it in self._iter_status_entries(status_data):
+                    k = (it.get("key","") or "").lower()
+                    if k.startswith("fan speed"):
+                        m = re.search(r'fan speed\s+(\d+)', k)
+                        if m:
+                            max_fan_idx = max(max_fan_idx, int(m.group(1)))
+                    elif k.startswith("pump speed"):
+                        self.have_pump = True
+                self.fan_count = max_fan_idx or 6
+            except Exception as e:
+                self.show_status_message(f"Error detecting features: {e}")
+                self.fan_count = 6
+        else:
+            dev = self.selected_device.get("device")
+            if dev is None:
+                self.fan_count = 6
+            else:
+                try:
+                    with dev.connect():
+                        status = dev.get_status()
+                    max_fan_idx = 0
+                    for key, value, unit in status:
+                        k = (key or '').lower()
+                        if 'fan' in k and 'speed' in k:
+                            m = re.search(r'fan\s*(\d+)', k)
+                            if m:
+                                idx = int(m.group(1))
+                                max_fan_idx = max(max_fan_idx, idx)
+                        elif 'pump' in k and 'speed' in k:
+                            self.have_pump = True
+                    self.fan_count = max_fan_idx or 6
+                except Exception as e:
+                    self.show_status_message(f"Error detecting features: {e}")
+                    self.fan_count = 6
         font = QFont(); font.setPointSize(FONT_PT)
         self.add_fan_controls(self.fan_count, font)
         self.update_pump_row_visibility()
@@ -871,28 +979,66 @@ class LiquidCtlGUI(QMainWindow):
 
     def probe_pump_capability(self):
         if not self.have_pump:
-            self.pump_supported = False; self.update_pump_row_visibility(); return
-        ok = self._try_cmds(self._candidate_set_cmds("pump", None, 50), timeout=5)
-        self.pump_supported = bool(ok)
-        self.update_pump_row_visibility()
-        if not self.pump_supported:
-            self.show_status_message("Pump control not supported by this driver/device.")
+            # No pump present, so nothing to probe.
+            self.pump_supported = False
+            self.update_pump_row_visibility()
+            return
+        if self.use_cli:
+            ok = self._try_cmds(self._candidate_set_cmds("pump", None, 50), timeout=5)
+            self.pump_supported = bool(ok)
+            self.update_pump_row_visibility()
+            if not self.pump_supported:
+                self.show_status_message("Pump control not supported by this driver/device.")
+        else:
+            # Use the API to probe if setting the pump speed raises.
+            ok = False
+            dev = self.selected_device.get("device")
+            if dev is not None:
+                try:
+                    with dev.connect():
+                        dev.set_fixed_speed('pump', 50)
+                    ok = True
+                except Exception:
+                    ok = False
+            self.pump_supported = ok
+            self.update_pump_row_visibility()
+            if not self.pump_supported:
+                self.show_status_message("Pump control not supported by this driver/device.")
 
     def update_status(self):
         if not self.selected_device: return
         self.update_system_info()
 
-        status_parsed=False
-        try:
-            res = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status","--json"], timeout=8)
-            data = json.loads(res.stdout) if res.stdout else []
-            self._parse_json_and_update(data); status_parsed=True
-        except Exception:
+        status_parsed = False
+        if not self.use_cli:
+            # Read status via the Python API
+            dev = self.selected_device.get("device") if isinstance(self.selected_device, dict) else None
+            if dev is not None:
+                try:
+                    with dev.connect():
+                        data = dev.get_status()
+                    # Parse the (key, value, unit) tuples
+                    self._parse_devstatus_and_update(data)
+                    status_parsed = True
+                except Exception as e:
+                    self.show_status_message(f"Error updating status: {e}")
+            else:
+                # If no device object, we can't update via library
+                status_parsed = False
+        else:
+            # Read status by invoking the CLI
             try:
-                res2 = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status"], timeout=8)
-                self._parse_text_and_update(res2.stdout); status_parsed=True
-            except Exception as e2:
-                self.show_status_message(f"Error updating status: {e2}")
+                res = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status","--json"], timeout=8)
+                data = json.loads(res.stdout) if res.stdout else []
+                self._parse_json_and_update(data)
+                status_parsed = True
+            except Exception:
+                try:
+                    res2 = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status"], timeout=8)
+                    self._parse_text_and_update(res2.stdout)
+                    status_parsed = True
+                except Exception as e2:
+                    self.show_status_message(f"Error updating status: {e2}")
 
         ct=get_cpu_temp(); self.cpu_temp_label.setText(f"CPU Temperature: {ct:.1f} °C" if ct is not None else "CPU Temperature: N/A")
         gt=get_gpu_temp(); self.gpu_temp_label.setText(f"GPU Temperature: {gt:.1f} °C" if gt is not None else "GPU Temperature: N/A")
@@ -958,6 +1104,58 @@ class LiquidCtlGUI(QMainWindow):
             if m:
                 try: wtemp=float(m.group(2))
                 except: pass
+        self._update_ui_from_maps(fan_map, pump, wtemp)
+
+    def _parse_devstatus_and_update(self, status):
+        """Parse a status returned by the liquidctl Python API.
+
+        The API returns a list of (key, value, unit) tuples.  Keys are human
+        readable strings like ``Fan 1 speed``, ``Pump speed`` or
+        ``Liquid temperature``.  Values are numeric when appropriate, but may
+        come in different types (int, float, None).  Units are present for
+        compatibility with the CLI but not used here.
+
+        This method normalizes the information into the internal fan_map and
+        pump/water variables before delegating to `_update_ui_from_maps`.
+        """
+        fan_map = {}
+        pump = None
+        wtemp = None
+        for key, value, unit in status:
+            k = (key or '').lower()
+            # Detect fan speed entries.  Some drivers expose "fan speed 1"
+            # while others use "fan 1 speed"; use a loose regex to match both.
+            if 'fan' in k and 'speed' in k:
+                m = re.search(r'fan\s*(\d+)', k)
+                if m:
+                    idx = int(m.group(1))
+                    try:
+                        rpm = int(value)
+                    except Exception:
+                        try:
+                            rpm = int(float(value))
+                        except Exception:
+                            rpm = 0
+                    fan_map[idx] = (self.rpm_to_percent(rpm), rpm)
+                continue
+            # Detect pump speed entries
+            if 'pump' in k and 'speed' in k:
+                try:
+                    rpm = int(value)
+                except Exception:
+                    try:
+                        rpm = int(float(value))
+                    except Exception:
+                        rpm = 0
+                pump = (self.rpm_to_percent(rpm, True), rpm)
+                continue
+            # Detect water/liquid/coolant temperature entries
+            if any(word in k for word in ('water', 'liquid', 'coolant')) and 'temperature' in k:
+                try:
+                    wtemp = float(value)
+                except Exception:
+                    wtemp = None
+                continue
         self._update_ui_from_maps(fan_map, pump, wtemp)
 
     def _update_ui_from_maps(self, fan_map, pump, water_temp):
@@ -1055,13 +1253,105 @@ class LiquidCtlGUI(QMainWindow):
         return cmds
 
     def _try_cmds(self, cmds, timeout=6):
+        """Attempt to execute one of several candidate commands.
+
+        When using the CLI backend this will iterate through all provided
+        commands, running each until one succeeds.  When using the Python
+        library we instead parse the command structure to call the
+        appropriate API methods.  Only the first candidate is attempted when
+        using the API, since either the operation will succeed or it will
+        raise.
+        """
+        if self.use_cli:
+            for c in cmds:
+                try:
+                    self.run_logged(c, check=True, timeout=timeout)
+                    return True
+                except Exception as e:
+                    log.debug(f"command failed: {' '.join(c)} -> {e}")
+            return False
+        # API backend: parse the command parameters and dispatch to the
+        # appropriate set speed call.  The expected format is
+        # ["liquidctl", "-m", <model>, "set", <channel>, <mode>, <percent>].
         for c in cmds:
             try:
-                self.run_logged(c, check=True, timeout=timeout)
-                return True
+                if len(c) < 7:
+                    continue
+                channel = c[4]
+                # percent is always the last element
+                pct_str = c[-1]
+                try:
+                    pct = int(pct_str)
+                except Exception:
+                    pct = int(float(pct_str))
+                if channel.startswith('fan'):
+                    if channel == 'fan':
+                        self._lib_set_speed('fan', None, pct)
+                    else:
+                        try:
+                            idx = int(channel[3:])
+                        except Exception:
+                            idx = None
+                        self._lib_set_speed('fan', idx, pct)
+                    return True
+                elif channel == 'pump':
+                    self._lib_set_speed('pump', None, pct)
+                    return True
             except Exception as e:
-                log.debug(f"command failed: {' '.join(c)} -> {e}")
+                log.debug(f"API command failed: {c} -> {e}")
         return False
+
+    def _lib_set_speed(self, kind, index, percent):
+        """Set a fan or pump speed using the liquidctl Python API.
+
+        Parameters
+        ----------
+        kind: str
+            Either 'fan' or 'pump'.
+        index: int or None
+            For fans, the 1-based channel index.  If None, all fans will be
+            targeted when supported by the driver.  Ignored for pumps.
+        percent: int
+            The desired duty percentage (0–100).
+
+        Returns
+        -------
+        bool
+            True if the operation appears to have succeeded, False otherwise.
+        """
+        dev = None
+        if isinstance(self.selected_device, dict):
+            dev = self.selected_device.get('device')
+        if dev is None:
+            return False
+        try:
+            with dev.connect():
+                if kind == 'pump':
+                    # Set pump speed; some drivers may not implement pump control
+                    dev.set_fixed_speed('pump', percent)
+                elif kind == 'fan':
+                    if index is None:
+                        # Try to set all fans at once; if unsupported, fall back
+                        try:
+                            dev.set_fixed_speed('fan', percent)
+                        except Exception:
+                            # Fall back to per-channel update for each fan
+                            for chan in range(1, self.fan_count + 1):
+                                try:
+                                    dev.set_fixed_speed(f'fan{chan}', percent)
+                                except Exception:
+                                    pass
+                    else:
+                        # Specific fan channel
+                        dev.set_fixed_speed(f'fan{index}', percent)
+            return True
+        except Exception as e:
+            # Log and surface the error through the status bar; avoid crashing.
+            try:
+                self.show_status_message(f"Failed to set {kind} speed: {e}")
+            except Exception:
+                pass
+            return False
 
     def adjust_all_fans(self, value):
         pct = round(value/10)*10
@@ -1090,9 +1380,17 @@ class LiquidCtlGUI(QMainWindow):
 
     def apply_all_fan_speeds(self):
         speeds=[s.value() for s in self.fan_sliders]
+        # Apply all fan speeds asynchronously.  When using the CLI backend the
+        # commands are executed via the CLI; when using the Python API we call
+        # the library directly.  The per-channel loop ensures that drivers
+        # lacking an all-fan command still receive the correct duty per fan.
         def worker():
-            for fan_id, pct in enumerate(speeds,1):
-                self._try_cmds(self._candidate_set_cmds("fan", fan_id, pct))
+            if self.use_cli:
+                for fan_id, pct in enumerate(speeds, 1):
+                    self._try_cmds(self._candidate_set_cmds("fan", fan_id, pct))
+            else:
+                for fan_id, pct in enumerate(speeds, 1):
+                    self._lib_set_speed('fan', fan_id, pct)
         threading.Thread(target=worker, daemon=True).start()
 
     def adjust_pump_speed(self, value):
@@ -1108,7 +1406,10 @@ class LiquidCtlGUI(QMainWindow):
         if not (self.user_set_pump_speed and self.have_pump and self.pump_supported): return
         pct,_=self.user_set_pump_speed
         def worker():
-            self._try_cmds(self._candidate_set_cmds("pump", None, pct))
+            if self.use_cli:
+                self._try_cmds(self._candidate_set_cmds("pump", None, pct))
+            else:
+                self._lib_set_speed('pump', None, pct)
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- % <-> RPM ----------
