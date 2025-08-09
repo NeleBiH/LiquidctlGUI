@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Mini Corsair iCUE for Linux – Liquidctl GUI (Qt/PyQt6)
+LiquidctlGUI for Linux – Liquidctl GUI (Qt/PyQt6)
 
 What you get:
 - Universal liquidctl front-end (no hard-coded devices).
@@ -371,7 +371,7 @@ class LiquidCtlGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self._apply_compact_if_needed()
-        self.setWindowTitle("Mini Corsair iCUE for Linux")
+        self.setWindowTitle("LiquidctlGUI for Linux")
         self.setGeometry(80, 80, 1100, 720)
 
         # State
@@ -1722,7 +1722,7 @@ X-GNOME-Autostart-enabled=true
 
     def show_about(self):
         QMessageBox.information(self, "About",
-"""Mini Corsair iCUE for Linux
+"""LiquidctlGUI for Linux
 Profiles: ~/.liquidctl_gui.json (reads legacy ~/.LIquidctl_settings.json)
 Creator: Nele
 """)
@@ -1733,7 +1733,7 @@ Creator: Nele
 
     def closeEvent(self, event):
         event.ignore(); self.hide()
-        self.tray_icon.showMessage("Mini Corsair iCUE","Minimized to tray. Use 'Exit' to close.",
+        self.tray_icon.showMessage("LiquidctlGUI","Minimized to tray. Use 'Exit' to close.",
                                    QSystemTrayIcon.MessageIcon.Information, 2000)
 
 # ---------- main ----------
