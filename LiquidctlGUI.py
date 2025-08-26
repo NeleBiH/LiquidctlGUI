@@ -26,7 +26,7 @@ What this provides:
   application shortcut to the desktop, quick presets, and exit.
 - Adaptive layout for 1080p (compact mode) with a splitter and scroll area.
 
-This GUI is based on the liquidctl project and is distributed under the
+This GUI is based on the liquidctl project https://github.com/liquidctl/liquidctl and is distributed under the
 GPLv3 license.
 """
 
