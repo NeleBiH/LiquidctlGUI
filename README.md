@@ -1,5 +1,6 @@
 
 A simple GUI for [liquidctl](https://github.com/liquidctl/liquidctl) to control **fans** and **pump** on devices such as the Corsair Commander Core.  
+Unfortunately i have only one device to test so if you run this please let me know does it work.
 I am not a programmer – this was **built with AI assistance** – use at your own risk. If your cat catches fire, it’s on you. 😉
 
 <img width="1920" height="1042" alt="Screenshot_20250826_183020" src="https://github.com/user-attachments/assets/5860af41-2da0-489b-85eb-6d7ca831958a" />
@@ -62,7 +63,7 @@ I am not a programmer – this was **built with AI assistance** – use at your 
 
 > **Notes:**
 ---------------------------------------------------------------------
-> – Some devices (e.g., “Commander Core (broken)”) won’t support pump/RGB control; we’ll show the pump row only when it’s actually supported.  
+> – Some devices (e.g., “Commander Core (broken)”) won’t support pump/RGB control; code will show the pump row only when it’s actually supported.  
 > – The RPM↔% mapping in the UI is an estimate; real RPM is shown from device status on refresh.
 
 
