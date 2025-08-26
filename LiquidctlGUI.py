@@ -4,25 +4,33 @@
 """
 LiquidctlGUI for Linux – Liquidctl GUI (Qt/PyQt6)
 
-What you get:
-- Universal liquidctl front-end (no hard-coded devices).
-- Auto-detect fan count + pump presence from `liquidctl status`.
-- Manual fan & pump control with per-fan sliders and "All fans".
-- Profiles (save/edit/delete) + tray menu quick switch.
-- Safety (Emergency Boost) with hysteresis.
-- Simple auto curves (optional) via small dialog.
-- Inline rename of fans (double-click).
-- Export/Import settings JSON.
-- Debug log in a separate window.
-- Adaptive layout for 1080p (compact mode), splitter + scroll area.
-- Rolling graph with proper margins/grid so axes are readable.
-- Clean GPU model string (NVIDIA/AMD/Intel).
+What this provides:
+- Universal liquidctl front‑end (no hard‑coded devices).
+- Auto‑detection of the number of fans and the presence of a pump using
+  ``liquidctl status``.
+- Additional detection via ``/sys/class/hwmon`` when fans are connected
+  directly to the motherboard.
+- Automatic grouping into columns with horizontal side scrolling when many
+  fans are present.
+- Manual adjustment of fan and pump speeds per channel plus an "All fans"
+  control.
+- Profiles (save/edit/delete) with quick switching through the tray menu.
+- Safety (Emergency Boost) with hysteresis and an optional alarm.  The
+  alarm uses the CPU threshold from the safety settings and plays
+  ``alarm.mp3`` from the application directory.
+- Simple automatic curves (optional) with a small editor.
+- Inline renaming of fans (double‑click).
+- Export/import settings as JSON.
+- Debug window with a log.
+- System tray integration: run on start, start minimized, add an
+  application shortcut to the desktop, quick presets, and exit.
+- Adaptive layout for 1080p (compact mode) with a splitter and scroll area.
 
-Removed by request:
-- “Enter raw liquidctl command” and “Run” button.
+This GUI is based on the liquidctl project and is distributed under the
+GPLv3 license.
 """
 
-import sys, os, time, logging, subprocess, shutil, threading, re, json
+import sys, os, time, logging, subprocess, shutil, threading, re, json, math
 from functools import partial
 from collections import deque
 
@@ -35,34 +43,53 @@ from PyQt6.QtWidgets import (
     QFileDialog, QPlainTextEdit, QSplitter, QScrollArea, QFrame
 )
 from PyQt6.QtGui import QIcon, QAction, QFont
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QUrl
 
-# Try to import the liquidctl Python library.  If available we can talk
-# directly to supported devices instead of spawning the external
-# `liquidctl` command.  This improves performance and avoids the need
-# for a separate CLI installation.  If the import fails we silently
-# fall back to invoking the command line tool.
+# QtMultimedia support for MP3 alarm (if available)
+HAVE_QTMULTIMEDIA = False
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    HAVE_QTMULTIMEDIA = True
+except Exception:
+    HAVE_QTMULTIMEDIA = False
+
+# Attempt to directly import the liquidctl library; if it is not present, fall back to the CLI
 HAVE_LIQUIDCTL_LIB = False
 try:
     import liquidctl  # type: ignore
     from liquidctl import find_liquidctl_devices  # type: ignore
     HAVE_LIQUIDCTL_LIB = True
 except Exception:
-    # Attempt to load a local copy of the library from a sibling
-    # directory (e.g. when running from an extracted release).
     try:
         here = os.path.dirname(os.path.abspath(__file__))
     except Exception:
         here = os.getcwd()
+    # Attempt to locate a bundled liquidctl library.  Depending on how the
+    # source archive is unpacked, the library may reside in a nested
+    # ``liquidctl-main/liquidctl`` or directly under ``liquidctl-main``.
     local_lib = os.path.join(here, "liquidctl-main")
-    if os.path.isdir(os.path.join(local_lib, "liquidctl")):
-        sys.path.insert(0, local_lib)
-        try:
-            import liquidctl  # type: ignore
-            from liquidctl import find_liquidctl_devices  # type: ignore
-            HAVE_LIQUIDCTL_LIB = True
-        except Exception:
-            HAVE_LIQUIDCTL_LIB = False
+    candidate_paths = []
+    # Look for ``liquidctl`` at ``<local_lib>/liquidctl``
+    candidate_paths.append(local_lib)
+    # Look for ``liquidctl`` at ``<local_lib>/liquidctl-main`` (nested)
+    nested = os.path.join(local_lib, "liquidctl-main")
+    if os.path.isdir(nested):
+        candidate_paths.append(nested)
+    for path in candidate_paths:
+        if os.path.isdir(os.path.join(path, "liquidctl")):
+            sys.path.insert(0, path)
+            try:
+                import liquidctl  # type: ignore
+                from liquidctl import find_liquidctl_devices  # type: ignore
+                HAVE_LIQUIDCTL_LIB = True
+                break
+            except Exception:
+                # If import fails, remove the path and keep trying
+                try:
+                    sys.path.remove(path)
+                except Exception:
+                    pass
+                continue
 
 # ====== Adaptive UI defaults; shrinks on 1080p in _apply_compact_if_needed ======
 FONT_PT   = 13
@@ -119,12 +146,13 @@ def load_json_config():
                 data.setdefault("global", {})
                 g = data["global"]
                 g.setdefault("run_on_start", False)
+                g.setdefault("start_minimized", False)      # NEW
                 g.setdefault("last_profile", None)
                 g.setdefault("link_fans", False)
                 g.setdefault("language", "English")
-                g.setdefault("show_graph", True)  # may get toggled off on first 1080p run
+                g.setdefault("show_graph", True)
 
-                data.setdefault("safety", {"enabled": False, "cpu_crit": 85, "water_crit": 45, "hysteresis": 5})
+                data.setdefault("safety", {"enabled": False, "cpu_crit": 85, "water_crit": 45, "hysteresis": 5, "alarm_enabled": False})  # NEW
                 data.setdefault("curves", {
                     "enabled": False,
                     "apply_pump": True,
@@ -139,8 +167,8 @@ def load_json_config():
         except Exception:
             pass
     return {
-        "global": {"run_on_start": False, "last_profile": None, "link_fans": False, "language": "English", "show_graph": True},
-        "safety": {"enabled": False, "cpu_crit": 85, "water_crit": 45, "hysteresis": 5},
+        "global": {"run_on_start": False, "start_minimized": False, "last_profile": None, "link_fans": False, "language": "English", "show_graph": True},
+        "safety": {"enabled": False, "cpu_crit": 85, "water_crit": 45, "hysteresis": 5, "alarm_enabled": False},
         "curves": {
             "enabled": False, "apply_pump": True,
             "cpu": {"p1":[30,20], "p2":[60,60], "p3":[80,100]},
@@ -178,7 +206,7 @@ def get_cpu_temp():
                     try: val = float(v)
                     except: continue
                     label = sec.get(k.replace('_input','_label'), '')
-                    if chip_is_cpu or re.search(r'(tctl|tdie|package|core|cpu)', str(label).lower() or ''):
+                    if chip_is_cpu or re.search(r'(tctl|tdie|package|core|cpu)',  str(label).lower() or ''):
                         if 5.0 <= val <= 120.0:
                             best = val if best is None else max(best, val)
         if best is not None: return best
@@ -257,7 +285,7 @@ class ProfileDialog(QDialog):
         self.pump_speed_label = QLabel(f"Pump Speed: {pump_speed}%"); self.pump_speed_label.setFont(font)
         self.pump_speed_slider = QSlider(Qt.Orientation.Horizontal); self.pump_speed_slider.setRange(0,100)
         self.pump_speed_slider.setTickInterval(10); self.pump_speed_slider.setSingleStep(10)
-        self.pump_speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow); self.pump_speed_slider.setMinimumHeight(SLIDER_H)
+        self.pump_speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow);  self.pump_speed_slider.setMinimumHeight(SLIDER_H)
         self.pump_speed_slider.setStyleSheet(pump_slider_style); self.pump_speed_slider.setValue(pump_speed)
         self.pump_speed_slider.valueChanged.connect(self._upd_pump_label)
         layout.addRow(self.pump_speed_label); layout.addWidget(self.pump_speed_slider)
@@ -355,6 +383,72 @@ class DebugDialog(QDialog):
         if isinstance(self.parent(), LiquidCtlGUI):
             self.parent().debug_lines.clear()
 
+# ---------- Separate graph window ----------
+class GraphDialog(QDialog):
+    """
+    A resizable window to display the rolling temperature graph.
+
+    This dialog owns its own matplotlib figure and canvas.  It exposes
+    a ``update_data`` method that accepts timestamp and temperature
+    lists.  The graph shows CPU and water temperature, fixes the Y-axis
+    to 10–100 °C and displays a 60 s window on the X-axis.
+    """
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Temperature Graph")
+        self.resize(800, 400)
+        if not HAVE_MPL:
+            v = QVBoxLayout()
+            v.addWidget(QLabel("Matplotlib is required for the graph."))
+            self.setLayout(v)
+            self.canvas = None
+            return
+        self.fig = Figure(figsize=(5, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.fig.subplots_adjust(left=0.09, right=0.98, top=0.93, bottom=0.28)
+        self.ax.set_xlabel("seconds")
+        self.ax.set_ylabel("°C")
+        self.ax.grid(True, which="both", axis="both", linestyle="--", alpha=0.3)
+        self._cpu_line, = self.ax.plot([], [], label="CPU")
+        self._water_line, = self.ax.plot([], [], label="Water")
+        self.ax.legend(loc="upper left")
+        self.canvas = FigureCanvas(self.fig)
+        v = QVBoxLayout(); compactify(v)
+        v.addWidget(self.canvas)
+        h = QHBoxLayout(); compactify(h)
+        h.addStretch(1)
+        btn_close = QPushButton("Close"); btn_close.setMinimumHeight(BTN_H); btn_close.clicked.connect(self.close)
+        h.addWidget(btn_close)
+        v.addLayout(h)
+        self.setLayout(v)
+
+    def update_data(self, times, cpu_vals, water_vals) -> None:
+        if not self.canvas:
+            return
+        self._cpu_line.set_data(times, cpu_vals)
+        self._water_line.set_data(times, water_vals)
+        if times:
+            xmax = times[-1]
+            xmin = max(0.0, xmax - 60.0)
+            if xmax - xmin < 60.0:
+                xmax = xmin + 60.0
+        else:
+            xmin, xmax = 0.0, 60.0
+        self.ax.set_xlim(xmin, xmax)
+        self.ax.set_ylim(10.0, 100.0)
+        try:
+            start_tick = int(xmin)
+            end_tick = int(xmax) + 1
+            ticks = list(range(start_tick, end_tick, 10))
+        except Exception:
+            pass
+        self.canvas.draw_idle()
+        if hasattr(self, 'graph_dlg') and self.graph_dlg and self.graph_dlg.isVisible():
+            try:
+                self.graph_dlg.update_data(t_list, cpu_list, water_list)
+            except Exception:
+                pass
+
 # ---------- Optional rolling graphs ----------
 HAVE_MPL = False
 try:
@@ -393,11 +487,7 @@ class LiquidCtlGUI(QMainWindow):
         self.min_pump_rpm, self.max_pump_rpm = 1000, 2700
         self._last_water_temp = None
 
-        # Determine if we should use the Python library or fall back to the CLI.
-        # When HAVE_LIQUIDCTL_LIB is true we can talk to devices directly via
-        # the liquidctl API; otherwise we spawn the `liquidctl` command as
-        # before.  Storing this in an instance variable allows other methods
-        # to conditionally branch without repeatedly checking the global.
+        # Choose backend (use the CLI when the liquidctl library is not available)
         self.use_cli = not HAVE_LIQUIDCTL_LIB
 
         # Rename state
@@ -408,9 +498,27 @@ class LiquidCtlGUI(QMainWindow):
         self.debug_lines = []
         self.debug_dlg = None
 
+        # Exit flag
+        self.closing_via_exit = False
+
         # Safety boost
         self._boost_active = False
         self._preboost = None
+
+        # Alarm
+        self._last_alarm_time = 0
+        self._alarm_process = None
+        self.alarm_player = None
+        self.alarm_audio = None
+        if HAVE_QTMULTIMEDIA:
+            try:
+                self.alarm_player = QMediaPlayer(self)
+                self.alarm_audio = QAudioOutput(self)
+                self.alarm_player.setAudioOutput(self.alarm_audio)
+                self.alarm_audio.setVolume(1.0)
+            except Exception:
+                self.alarm_player = None
+                self.alarm_audio = None
 
         # Graph history
         self._hist_t = deque(maxlen=180)
@@ -424,20 +532,78 @@ class LiquidCtlGUI(QMainWindow):
         self.pump_apply_timer = QTimer(); self.pump_apply_timer.setSingleShot(True); self.pump_apply_timer.timeout.connect(self.apply_pump_speed)
 
         # Tray + statusbar
-        self._statusbar = QStatusBar(self); self.setStatusBar(self._statusbar)
-        icon_paths = [os.path.join(os.path.dirname(__file__), "icon.png"),
-                      "/usr/share/icons/liquidctl-gui.png", "/usr/local/share/icons/liquidctl-gui.png"]
-        app_icon = None
-        for p in icon_paths:
-            if os.path.exists(p): app_icon = QIcon(p); break
-        if app_icon is None: app_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-        self.tray_icon = QSystemTrayIcon(self); self.tray_icon.setIcon(app_icon)
-        self.tray_menu = QMenu(); self.tray_icon.setContextMenu(self.tray_menu); self.tray_icon.show()
+        self._statusbar = QStatusBar(self)
+        self.setStatusBar(self._statusbar)
+
+        def _load_tux_icon():
+            """Attempt to build a QIcon from the local tux_icon_pack folder."""
+            try:
+                from PyQt6.QtCore import QSize
+                from PyQt6.QtGui import QPixmap, QImage, QPalette
+            except Exception:
+                return None
+            icon_dir = os.path.join(os.path.dirname(__file__), "tux_icon_pack")
+            if not os.path.isdir(icon_dir):
+                return None
+            icon = QIcon()
+            try:
+                pal = QApplication.instance().palette()
+                is_dark = pal.color(QPalette.ColorRole.Window).lightness() < 128
+            except Exception:
+                is_dark = False
+            sizes = [16, 22, 24, 32, 48, 64, 128, 256]
+            found_any = False
+            for sz in sizes:
+                fname = f"png{sz}x{sz}.png"
+                fpath = os.path.join(icon_dir, fname)
+                if os.path.exists(fpath):
+                    try:
+                        from PyQt6.QtGui import QPixmap, QImage
+                        pix = QPixmap(fpath)
+                        if is_dark:
+                            img = pix.toImage()
+                            img.invertPixels(QImage.InvertMode.InvertRgb)
+                            pix = QPixmap.fromImage(img)
+                        icon.addPixmap(pix, QIcon.Mode.Normal, QIcon.State.Off)
+                        found_any = True
+                    except Exception:
+                        icon.addFile(fpath, QSize(sz, sz))
+                        found_any = True
+            svg_path = os.path.join(icon_dir, "svg256x256.svg")
+            if os.path.exists(svg_path):
+                icon.addFile(svg_path)
+                found_any = True
+            return icon if found_any and not icon.isNull() else None
+
+        app_icon = _load_tux_icon()
+        if app_icon is None:
+            icon_paths = [
+                os.path.join(os.path.dirname(__file__), "icon.png"),
+                "/usr/share/icons/liquidctl-gui.png",
+                "/usr/local/share/icons/liquidctl-gui.png",
+            ]
+            for p in icon_paths:
+                if os.path.exists(p):
+                    app_icon = QIcon(p)
+                    break
+            if app_icon is None or app_icon.isNull():
+                app_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(app_icon)
+        self.tray_menu = QMenu()
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.show()
 
         self.init_ui()
         self.safe_refresh_devices(select_first=True)
         self.update_status()
         self.rebuild_tray_menu(selected_profile=self.conf["global"].get("last_profile"))
+
+        try:
+            QTimer.singleShot(0, self.check_and_install_dependencies)
+        except Exception:
+            pass
 
     # ---------- Adaptive sizing ----------
     def _apply_compact_if_needed(self):
@@ -490,7 +656,7 @@ class LiquidCtlGUI(QMainWindow):
         return btn
 
     def _mk_btn(self, text, cb):
-        b = QPushButton(text); b.setMinimumHeight(BTN_H); b.clicked.connect(cb); return b
+        b = QPushButton(text); b.setMinimumHeight(BTN_H); b.clicked.connect(cb);  return b
 
     def _vsep(self):
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine); sep.setFrameShadow(QFrame.Shadow.Sunken)
@@ -534,7 +700,7 @@ class LiquidCtlGUI(QMainWindow):
         self.update_profile_combo()
 
         # Quick controls
-        quick_group = QGroupBox("Quick Controls"); quick_layout = QHBoxLayout(); compactify(quick_layout)
+        quick_group = QGroupBox("Quick Controls"); quick_layout = QHBoxLayout();  compactify(quick_layout)
         self.allfans_label = QLabel("All Fans"); self.allfans_label.setFont(font); self.allfans_label.setFixedWidth(NAME_COL_W)
         self.allfans_pct = QLabel("0 %"); self.allfans_pct.setFont(font); self.allfans_pct.setFixedWidth(PCT_COL_W)
         self.allfans_slider = QSlider(Qt.Orientation.Horizontal); self.allfans_slider.setRange(0,100)
@@ -562,9 +728,13 @@ class LiquidCtlGUI(QMainWindow):
         self.water_crit.valueChanged.connect(self._save_safety)
         self.hyst = QSpinBox(); self.hyst.setRange(0, 20); self.hyst.setSuffix(" °C"); self.hyst.setValue(int(self.safety.get("hysteresis",5)))
         self.hyst.valueChanged.connect(self._save_safety)
-        for w in (self.safety_enable, QLabel("CPU ≥"), self.cpu_crit, QLabel("Water ≥"), self.water_crit, QLabel("Hysteresis"), self.hyst):
+        # Alarm checkbox (uses the CPU threshold)
+        self.alarm_enable = QCheckBox("Alarm"); self.alarm_enable.setChecked(self.safety.get("alarm_enabled", False))
+        self.alarm_enable.toggled.connect(self._save_safety)
+        for w in (self.safety_enable, QLabel("CPU ≥"), self.cpu_crit, QLabel("Water ≥"), self.water_crit, QLabel("Hysteresis"), self.hyst, self.alarm_enable):
             s_layout.addWidget(w)
-        s_layout.addWidget(self._info_button("Boost 100% when above thresholds. Turns off below (threshold − hysteresis).", "Safety – help"))
+        s_layout.addWidget(self._info_button("Boost 100% when above thresholds. Turns off below (threshold − hysteresis).\n"
+                                             "Alarm: koristi CPU prag iznad (svira alarm.mp3 iz mape aplikacije).", "Safety – help"))
         safety_group.setLayout(s_layout); top_v.addWidget(safety_group)
 
         # Fan & Pump Control
@@ -577,11 +747,11 @@ class LiquidCtlGUI(QMainWindow):
         for w in (Hname, Hrpm, Hpct, Hsl): header.addWidget(w)
         self.control_layout.addLayout(header)
 
-        # Pump row (visible only if pump + supported)
+        # Pump row (visible only if the device supports a pump)
         self.pump_row = QHBoxLayout(); compactify(self.pump_row)
         self.pump_name_inline = QLabel("Pump"); self.pump_name_inline.setFont(font); self.pump_name_inline.setFixedWidth(NAME_COL_W)
         self.pump_rpm_inline = QLabel("N/A");    self.pump_rpm_inline.setFont(font);  self.pump_rpm_inline.setFixedWidth(RPM_COL_W)
-        self.pump_percent_inline = QLabel("0 %");self.pump_percent_inline.setFont(font); self.pump_percent_inline.setFixedWidth(PCT_COL_W)
+        self.pump_percent_inline = QLabel("0 %"); self.pump_percent_inline.setFont(font); self.pump_percent_inline.setFixedWidth(PCT_COL_W)
         self.pump_slider = QSlider(Qt.Orientation.Horizontal); self.pump_slider.setRange(0,100)
         self.pump_slider.setTickInterval(10); self.pump_slider.setSingleStep(10)
         self.pump_slider.setTickPosition(QSlider.TickPosition.TicksBelow); self.pump_slider.setMinimumHeight(SLIDER_H)
@@ -592,11 +762,24 @@ class LiquidCtlGUI(QMainWindow):
             self.pump_row.addWidget(w)
         self.control_layout.addLayout(self.pump_row)
 
-        # Fan rows
-        self.fan_rows_layouts=[]; self.fan_rpm_inline_labels=[]; self.fan_percent_inline_labels=[]; self.fan_sliders=[]; self.fan_name_labels=[]
-        self.fan_name_edits={}
-        self.add_fan_controls(6, font)
-        self.control_group.setLayout(self.control_layout); top_v.addWidget(self.control_group)
+        # ---------------- NEW: fan grid container (columns + side scroll) ----------------
+        # Widget that will hold multiple columns of fan rows.  If there are many fans,
+        # the width increases and the QScrollArea (below) automatically obtains a horizontal scroll bar.
+        self.fan_grid_widget = QWidget()
+        self.fan_grid_layout = QHBoxLayout()
+        compactify(self.fan_grid_layout)
+        self.fan_grid_widget.setLayout(self.fan_grid_layout)
+        self.control_layout.addWidget(self.fan_grid_widget)
+        # -------------------------------------------------------------------------------
+
+        self.control_group.setLayout(self.control_layout)
+
+        # Scroll area for the entire control panel (provides vertical and horizontal scrollbars as needed)
+        fan_scroll = QScrollArea()
+        fan_scroll.setWidgetResizable(True)
+        fan_scroll.setWidget(self.control_group)
+        fan_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        top_v.addWidget(fan_scroll)
 
         # ---- bottom panel ----
         status_layout = QHBoxLayout(); compactify(status_layout)
@@ -611,26 +794,24 @@ class LiquidCtlGUI(QMainWindow):
         sys_group.setLayout(sys_v); status_layout.addWidget(sys_group, 1)
 
         temp_group = QGroupBox("Temperature"); temp_v = QVBoxLayout(); compactify(temp_v)
-        top_t = QHBoxLayout(); compactify(top_t)
         self.temp_label = QLabel("Water Temperature: N/A"); self.temp_label.setFont(font)
         self.cpu_temp_label = QLabel("CPU Temperature: N/A"); self.cpu_temp_label.setFont(font)
         self.gpu_temp_label = QLabel("GPU Temperature: N/A"); self.gpu_temp_label.setFont(font)
-        top_t.addWidget(self.temp_label); top_t.addWidget(self._vsep())
-        top_t.addWidget(self.cpu_temp_label); top_t.addWidget(self._vsep())
-        top_t.addWidget(self.gpu_temp_label)
-        top_t.addStretch(1)
-        self.show_graph_chk = QCheckBox("Show graph")
-        self.show_graph_chk.setChecked(bool(self.conf["global"].get("show_graph", not self.compact)))
-        self.show_graph_chk.toggled.connect(self._toggle_graph)
+        temp_v.addWidget(self.temp_label)
+        temp_v.addWidget(self.cpu_temp_label)
+        temp_v.addWidget(self.gpu_temp_label)
+        buttons_layout = QHBoxLayout(); compactify(buttons_layout)
+        graph_btn = self._mk_btn("Graph…", self.open_graph_dialog)
         btn_curves = self._mk_btn("Curves…", self.open_curves_dialog)
-        top_t.addWidget(self.show_graph_chk); top_t.addWidget(btn_curves)
-        temp_v.addLayout(top_t)
+        buttons_layout.addWidget(graph_btn)
+        buttons_layout.addWidget(btn_curves)
+        buttons_layout.addStretch(1)
+        temp_v.addLayout(buttons_layout)
 
         self.canvas = None
         if HAVE_MPL:
             self.fig = Figure(figsize=(5, 1.8 if self.compact else 2.1), dpi=100)
             self.ax = self.fig.add_subplot(111)
-            # Better margins so tick labels are visible
             self.fig.subplots_adjust(left=0.09, right=0.98, top=0.93, bottom=0.28)
             self.ax.set_xlabel("seconds"); self.ax.set_ylabel("°C")
             self.ax.grid(True, which='both', axis='both', linestyle='--', alpha=0.3)
@@ -639,13 +820,13 @@ class LiquidCtlGUI(QMainWindow):
             self.ax.legend(loc="upper left")
             self.canvas = FigureCanvas(self.fig)
             temp_v.addWidget(self.canvas)
-            self.canvas.setVisible(self.show_graph_chk.isChecked())
+            self.canvas.setVisible(False)
         else:
             temp_v.addWidget(QLabel("Install matplotlib for rolling graphs."))
         temp_group.setLayout(temp_v); status_layout.addWidget(temp_group, 2)
         bottom_v.addLayout(status_layout)
 
-        # Tools row (no raw command)
+        # Tools row
         tools_row = QHBoxLayout(); compactify(tools_row)
         btn_debug   = self._mk_btn("Debug…", self.open_debug_dialog)
         btn_exp_settings = self._mk_btn("Export Settings", self.export_settings)
@@ -664,7 +845,6 @@ class LiquidCtlGUI(QMainWindow):
         bottom.addWidget(self._info_button("Language: placeholder. Real translations later.", "Language – info"))
         bottom_panel.setLayout(bottom_v)
 
-        # Splitter + scroll wrapper
         splitter = QSplitter(Qt.Orientation.Vertical)
         top_panel.setLayout(top_v); splitter.addWidget(top_panel)
         splitter.addWidget(bottom_panel)
@@ -690,7 +870,8 @@ class LiquidCtlGUI(QMainWindow):
             "enabled": bool(self.safety_enable.isChecked()),
             "cpu_crit": int(self.cpu_crit.value()),
             "water_crit": int(self.water_crit.value()),
-            "hysteresis": int(self.hyst.value())
+            "hysteresis": int(self.hyst.value()),
+            "alarm_enabled": bool(self.alarm_enable.isChecked())
         }
         self.conf["safety"] = self.safety
         save_json_config(self.conf)
@@ -812,13 +993,9 @@ class LiquidCtlGUI(QMainWindow):
     # ---------- Device / permissions ----------
     def safe_refresh_devices(self, select_first=False):
         prev_desc = self.selected_device["description"] if self.selected_device else None
-        # When using the Python library we query connected devices directly; otherwise we
-        # fall back to invoking the liquidctl CLI.  The resulting list of
-        # dictionaries always contains at least a human readable description and,
-        # for the library case, a reference to the driver instance under the
-        # ``device`` key.
         if not self.use_cli:
             try:
+                self._append_debug(f"$ find_liquidctl_devices()")
                 devices = list(find_liquidctl_devices())
             except Exception as e:
                 self.show_status_message(f"Refresh failed: {e}")
@@ -847,7 +1024,6 @@ class LiquidCtlGUI(QMainWindow):
                 return
             if not new_list:
                 self.show_status_message("No devices found."); return
-        # Populate the combo box and preserve the previously selected device if possible
         self.devices = new_list
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
@@ -874,8 +1050,6 @@ class LiquidCtlGUI(QMainWindow):
     def initialize_device(self):
         if not self.selected_device:
             return
-        # For library-backed devices we initialize via the API; otherwise we
-        # fall back to the CLI.  Always probe for pump capability afterwards.
         if self.use_cli:
             try:
                 self.run_logged(["liquidctl","-m", self.selected_device["description"], "initialize"], timeout=8)
@@ -886,12 +1060,8 @@ class LiquidCtlGUI(QMainWindow):
             if dev is None:
                 return
             try:
-                # Connect and initialize the device.  The context manager
-                # ensures disconnect() is called even if initialization
-                # fails.
                 with dev.connect():
-                    # Some drivers return additional status information; we
-                    # intentionally ignore the return value here.
+                    self._append_debug("$ dev.initialize()")
                     dev.initialize()
             except Exception as e:
                 self.show_status_message(f"Failed to initialize device: {e}")
@@ -922,7 +1092,7 @@ class LiquidCtlGUI(QMainWindow):
                     yield it
 
     def detect_features_from_status(self):
-        # Reset feature flags before probing.
+        prev_count = getattr(self, 'fan_count', 0)
         self.fan_count = 0
         self.have_pump = False
         if not self.selected_device:
@@ -934,16 +1104,49 @@ class LiquidCtlGUI(QMainWindow):
                 max_fan_idx = 0
                 for it in self._iter_status_entries(status_data):
                     k = (it.get("key","") or "").lower()
-                    if k.startswith("fan speed"):
-                        m = re.search(r'fan speed\s+(\d+)', k)
-                        if m:
-                            max_fan_idx = max(max_fan_idx, int(m.group(1)))
-                    elif k.startswith("pump speed"):
+                    # Look for fan channels in a permissive way: match "fan", optional
+                    # "speed", and then digits.  Some drivers report keys like
+                    # "fan speed 1", others use "fan1 speed" or even "fan 1 speed".
+                    m = re.search(r'fan\s*(?:speed)?\s*(\d+)', k)
+                    if m:
+                        try:
+                            idx = int(m.group(1))
+                            if idx > max_fan_idx:
+                                max_fan_idx = idx
+                        except Exception:
+                            pass
+                        continue
+                    # Identify presence of a pump by any key containing "pump" and
+                    # "speed", in either order.
+                    if 'pump' in k and 'speed' in k:
                         self.have_pump = True
                 self.fan_count = max_fan_idx or 6
-            except Exception as e:
-                self.show_status_message(f"Error detecting features: {e}")
-                self.fan_count = 6
+            except Exception:
+                try:
+                    res2 = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status"], timeout=8)
+                except Exception as e2:
+                    self.show_status_message(f"Error detecting features: {e2}")
+                    self.fan_count = 6
+                else:
+                    max_fan_idx = 0
+                    self.have_pump = False
+                    for line in (res2.stdout or "").splitlines():
+                        l = line.strip().lower()
+                        # Extract fan index using a permissive regex: "fan", optional "speed",
+                        # then digits.  Accepts lines like "fan1 speed", "fan speed 1",
+                        # or "fan 1 speed".
+                        m = re.search(r'fan\s*(?:speed)?\s*(\d+)', l)
+                        if m:
+                            try:
+                                idx = int(m.group(1))
+                                if idx > max_fan_idx:
+                                    max_fan_idx = idx
+                            except Exception:
+                                pass
+                        # Determine presence of pump
+                        if 'pump' in l and 'speed' in l:
+                            self.have_pump = True
+                    self.fan_count = max_fan_idx or 6
         else:
             dev = self.selected_device.get("device")
             if dev is None:
@@ -951,6 +1154,7 @@ class LiquidCtlGUI(QMainWindow):
             else:
                 try:
                     with dev.connect():
+                        self._append_debug("$ dev.get_status()")
                         status = dev.get_status()
                     max_fan_idx = 0
                     for key, value, unit in status:
@@ -966,6 +1170,33 @@ class LiquidCtlGUI(QMainWindow):
                 except Exception as e:
                     self.show_status_message(f"Error detecting features: {e}")
                     self.fan_count = 6
+
+        if self.fan_count == 0 and prev_count:
+            self.fan_count = prev_count
+
+        # Additionally: hwmon fanN_input counter (used when fans are not connected to a liquidctl device)
+        try:
+            hwmon_root = "/sys/class/hwmon"
+            if os.path.isdir(hwmon_root):
+                max_idx = 0
+                for entry in os.listdir(hwmon_root):
+                    dir_path = os.path.join(hwmon_root, entry)
+                    if not os.path.isdir(dir_path):
+                        continue
+                    for fname in os.listdir(dir_path):
+                        m = re.match(r'fan(\d+)_input', fname)
+                        if m:
+                            try:
+                                idx = int(m.group(1))
+                                if idx > max_idx:
+                                    max_idx = idx
+                            except Exception:
+                                pass
+                if max_idx > self.fan_count:
+                    self.fan_count = max_idx
+        except Exception:
+            pass
+
         font = QFont(); font.setPointSize(FONT_PT)
         self.add_fan_controls(self.fan_count, font)
         self.update_pump_row_visibility()
@@ -979,7 +1210,6 @@ class LiquidCtlGUI(QMainWindow):
 
     def probe_pump_capability(self):
         if not self.have_pump:
-            # No pump present, so nothing to probe.
             self.pump_supported = False
             self.update_pump_row_visibility()
             return
@@ -990,12 +1220,12 @@ class LiquidCtlGUI(QMainWindow):
             if not self.pump_supported:
                 self.show_status_message("Pump control not supported by this driver/device.")
         else:
-            # Use the API to probe if setting the pump speed raises.
             ok = False
             dev = self.selected_device.get("device")
             if dev is not None:
                 try:
                     with dev.connect():
+                        self._append_debug("$ dev.set_fixed_speed('pump', 50)")
                         dev.set_fixed_speed('pump', 50)
                     ok = True
                 except Exception:
@@ -1011,22 +1241,17 @@ class LiquidCtlGUI(QMainWindow):
 
         status_parsed = False
         if not self.use_cli:
-            # Read status via the Python API
             dev = self.selected_device.get("device") if isinstance(self.selected_device, dict) else None
             if dev is not None:
                 try:
                     with dev.connect():
+                        self._append_debug("$ dev.get_status()")
                         data = dev.get_status()
-                    # Parse the (key, value, unit) tuples
                     self._parse_devstatus_and_update(data)
                     status_parsed = True
                 except Exception as e:
                     self.show_status_message(f"Error updating status: {e}")
-            else:
-                # If no device object, we can't update via library
-                status_parsed = False
         else:
-            # Read status by invoking the CLI
             try:
                 res = self.run_logged(["liquidctl","-m", self.selected_device["description"], "status","--json"], timeout=8)
                 data = json.loads(res.stdout) if res.stdout else []
@@ -1042,6 +1267,14 @@ class LiquidCtlGUI(QMainWindow):
 
         ct=get_cpu_temp(); self.cpu_temp_label.setText(f"CPU Temperature: {ct:.1f} °C" if ct is not None else "CPU Temperature: N/A")
         gt=get_gpu_temp(); self.gpu_temp_label.setText(f"GPU Temperature: {gt:.1f} °C" if gt is not None else "GPU Temperature: N/A")
+
+        # Alarm at the CPU threshold (if enabled) – uses throttling so it does not spam
+        if self.safety.get("alarm_enabled", False) and ct is not None:
+            try:
+                if ct >= float(self.safety.get("cpu_crit", 85)):
+                    self._play_alarm_once()
+            except Exception:
+                pass
 
         if status_parsed: self.check_safety_boost(ct, self._last_water_temp)
 
@@ -1075,70 +1308,101 @@ class LiquidCtlGUI(QMainWindow):
     def _parse_json_and_update(self, status_data):
         fan_map = {}; pump=None; wtemp=None
         for it in self._iter_status_entries(status_data):
-            key = (it.get("key","") or "").lower()
+            key = (it.get("key", "") or "").lower()
             val = it.get("value", 0)
-            if key.startswith("fan speed"):
-                m = re.search(r'fan speed\s+(\d+)', key)
+            # Match fan speed entries more flexibly: keys may be formatted as
+            # "fan speed 1", "fan1 speed", "fan 1 speed" or similar.  Extract
+            # the numeric channel index from any of these patterns.
+            if 'fan' in key and 'speed' in key:
+                m = re.search(r'fan\s*(?:speed)?\s*(\d+)', key)
                 if m:
-                    idx=int(m.group(1)); rpm=int(val) if isinstance(val,(int,float)) else 0
-                    fan_map[idx]=(self.rpm_to_percent(rpm), rpm)
-            elif key.startswith("pump speed"):
-                rpm=int(val) if isinstance(val,(int,float)) else 0
-                pump=(self.rpm_to_percent(rpm, True), rpm)
-            elif "water temperature" in key or "liquid temperature" in key or "coolant temperature" in key:
-                try: wtemp=float(val)
-                except: pass
+                    try:
+                        idx = int(m.group(1))
+                    except Exception:
+                        idx = None
+                    # Only record entries with a valid numeric index
+                    if idx is not None:
+                        try:
+                            rpm = int(val) if isinstance(val, (int, float)) else int(float(val))
+                        except Exception:
+                            rpm = 0
+                        fan_map[idx] = (self.rpm_to_percent(rpm), rpm)
+                        continue
+            # Pump speed entries
+            if 'pump' in key and 'speed' in key:
+                try:
+                    rpm = int(val) if isinstance(val, (int, float)) else int(float(val))
+                except Exception:
+                    rpm = 0
+                pump = (self.rpm_to_percent(rpm, True), rpm)
+                continue
+            # Water/liquid/coolant temperature
+            if any(word in key for word in ("water temperature", "liquid temperature", "coolant temperature")):
+                try:
+                    wtemp = float(val)
+                except Exception:
+                    pass
         self._update_ui_from_maps(fan_map, pump, wtemp)
 
     def _parse_text_and_update(self, txt):
         fan_map = {}; pump=None; wtemp=None
         for line in txt.splitlines():
-            l=line.strip().lower()
-            m=re.search(r'fan speed\s+(\d+)\s+(\d+)\s*rpm', l)
+            l = line.strip().lower()
+            # Match fan speed lines flexibly: allow both "fan speed 1" and
+            # "fan1 speed" or "fan 1 speed", and capture the numeric RPM.
+            m = re.search(r'fan\s*(?:speed)?\s*(\d+)\s+(\d+)\s*rpm', l)
             if m:
-                idx=int(m.group(1)); rpm=int(m.group(2)); fan_map[idx]=(self.rpm_to_percent(rpm), rpm); continue
-            m=re.search(r'pump speed\s+(\d+)\s*rpm', l)
+                try:
+                    idx = int(m.group(1))
+                    rpm = int(m.group(2))
+                    fan_map[idx] = (self.rpm_to_percent(rpm), rpm)
+                except Exception:
+                    pass
+                continue
+            # Pump speed
+            m = re.search(r'pump\s*(?:speed)?\s*(\d+)\s*rpm', l)
             if m:
-                rpm=int(m.group(1)); pump=(self.rpm_to_percent(rpm, True), rpm); continue
-            m=re.search(r'(water|liquid|coolant)\s*temperature\s+([\d.]+)\s*°?c', l)
+                try:
+                    rpm = int(m.group(1))
+                    pump = (self.rpm_to_percent(rpm, True), rpm)
+                except Exception:
+                    pass
+                continue
+            # Water/liquid/coolant temperature
+            m = re.search(r'(water|liquid|coolant)\s*temperature\s+([\d.]+)\s*°?c', l)
             if m:
-                try: wtemp=float(m.group(2))
-                except: pass
+                try:
+                    wtemp = float(m.group(2))
+                except Exception:
+                    pass
         self._update_ui_from_maps(fan_map, pump, wtemp)
 
     def _parse_devstatus_and_update(self, status):
-        """Parse a status returned by the liquidctl Python API.
-
-        The API returns a list of (key, value, unit) tuples.  Keys are human
-        readable strings like ``Fan 1 speed``, ``Pump speed`` or
-        ``Liquid temperature``.  Values are numeric when appropriate, but may
-        come in different types (int, float, None).  Units are present for
-        compatibility with the CLI but not used here.
-
-        This method normalizes the information into the internal fan_map and
-        pump/water variables before delegating to `_update_ui_from_maps`.
-        """
         fan_map = {}
         pump = None
         wtemp = None
         for key, value, unit in status:
             k = (key or '').lower()
-            # Detect fan speed entries.  Some drivers expose "fan speed 1"
-            # while others use "fan 1 speed"; use a loose regex to match both.
             if 'fan' in k and 'speed' in k:
-                m = re.search(r'fan\s*(\d+)', k)
+                # Match fan index in keys like "fan speed 1", "fan1 speed",
+                # or "fan 1 speed".  Extract the digits following the word
+                # "fan" while optionally skipping the word "speed".
+                m = re.search(r'fan\s*(?:speed)?\s*(\d+)', k)
                 if m:
-                    idx = int(m.group(1))
                     try:
-                        rpm = int(value)
+                        idx = int(m.group(1))
                     except Exception:
+                        idx = None
+                    if idx is not None:
                         try:
-                            rpm = int(float(value))
+                            rpm = int(value)
                         except Exception:
-                            rpm = 0
-                    fan_map[idx] = (self.rpm_to_percent(rpm), rpm)
+                            try:
+                                rpm = int(float(value))
+                            except Exception:
+                                rpm = 0
+                        fan_map[idx] = (self.rpm_to_percent(rpm), rpm)
                 continue
-            # Detect pump speed entries
             if 'pump' in k and 'speed' in k:
                 try:
                     rpm = int(value)
@@ -1149,7 +1413,6 @@ class LiquidCtlGUI(QMainWindow):
                         rpm = 0
                 pump = (self.rpm_to_percent(rpm, True), rpm)
                 continue
-            # Detect water/liquid/coolant temperature entries
             if any(word in k for word in ('water', 'liquid', 'coolant')) and 'temperature' in k:
                 try:
                     wtemp = float(value)
@@ -1236,32 +1499,105 @@ class LiquidCtlGUI(QMainWindow):
         self._append_debug("EMERGENCY BOOST OFF")
         self.show_status_message("Emergency boost ended: restored previous speeds", 4000)
 
+    # ---------- Alarm ----------
+    def _alarm_path(self):
+        # alarm.mp3 next to the script (see screenshot)
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base = os.getcwd()
+        return os.path.join(base, "alarm.mp3")
+
+    def _play_alarm_once(self):
+        # throttling – at most once every 10 seconds
+        now = time.time()
+        if now - self._last_alarm_time < 10:
+            return
+        self._last_alarm_time = now
+        path = self._alarm_path()
+        if not os.path.exists(path):
+            self._append_debug(f"Alarm file not found: {path}")
+            return
+        # Prefer QtMultimedia when available
+        if HAVE_QTMULTIMEDIA and self.alarm_player is not None and self.alarm_audio is not None:
+            try:
+                self.alarm_player.setSource(QUrl.fromLocalFile(path))
+                self.alarm_audio.setVolume(1.0)
+                self.alarm_player.play()
+                return
+            except Exception as e:
+                self._append_debug(f"QtMultimedia alarm failed: {e}")
+        # Fallback: try a system player (non-blocking)
+        for cmd in [
+            ["ffplay","-nodisp","-autoexit","-loglevel","quiet",path],
+            ["paplay", path],
+            ["mpg123","-q", path],
+            ["cvlc","--play-and-exit","--qt-start-minimized", path],
+            ["vlc","--play-and-exit","--qt-start-minimized", path],
+            ["mplayer","-really-quiet", path],
+            ["mpv","--no-video","--quiet", path],
+            ["xdg-open", path],
+        ]:
+            if shutil.which(cmd[0]):
+                try:
+                    self._alarm_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except Exception:
+                    continue
+        self._append_debug("No available player to play alarm.mp3")
+
     # ---------- Apply speeds ----------
     def _candidate_set_cmds(self, kind, index=None, percent=0):
-        m = self.selected_device["description"] if self.selected_device else None
-        p=str(int(percent))
-        cmds=[]
-        if kind=="fan":
+        """
+        Build a list of potential commands for setting fan or pump speeds via the
+        liquidctl CLI.  Some devices accept different channel names for the
+        group of all fans or individual channels, so we attempt multiple
+        variants.  Commands are tried in order until one succeeds.
+
+        When controlling fans with a specific index (e.g. fan 1), we include
+        both compact (``fan1``) and spaced (``fan 1``) forms.  When controlling
+        all fans at once, ``fans`` is preferred over the legacy ``fan`` alias,
+        since certain drivers (e.g. the Corsair Commander Core) reject the
+        latter and expect ``fans`` to denote all fan channels.  The old alias
+        is kept as a fallback to maintain backwards compatibility with devices
+        that still support it.
+
+        ``kind`` should be either ``"fan"`` or ``"pump"``.  ``index`` is a
+        one-based integer for individual fan channels, or ``None`` to denote
+        all fans.  ``percent`` is the desired duty cycle expressed as an
+        integer percentage.
+        """
+        m = self.selected_device.get("description") if isinstance(self.selected_device, dict) else None
+        p = str(int(percent))
+        cmds: list[list[str]] = []
+
+        if kind == "fan":
+            # Determine the channel names to try.  When an index is provided,
+            # attempt both compact ("fan1") and spaced ("fan 1") spellings.
+            # Otherwise, request that all fans be set together using "fans",
+            # falling back to the legacy "fan" alias.
+            channels: list[str] = []
             if index is not None:
-                cmds.append(["liquidctl","-m",m,"set",f"fan{index}","speed",p])
-                cmds.append(["liquidctl","-m",m,"set",f"fan{index}","duty",p])
-            cmds.append(["liquidctl","-m",m,"set","fan","speed",p])
-            cmds.append(["liquidctl","-m",m,"set","fan","duty",p])
-        elif kind=="pump":
-            cmds.append(["liquidctl","-m",m,"set","pump","speed",p])
-            cmds.append(["liquidctl","-m",m,"set","pump","duty",p])
+                try:
+                    idx_str = str(int(index))
+                except Exception:
+                    idx_str = str(index)
+                channels.append(f"fan{idx_str}")
+                channels.append(f"fan {idx_str}")
+            else:
+                channels.append("fans")
+                channels.append("fan")
+            for ch in channels:
+                cmds.append(["liquidctl", "-m", m, "set", ch, "speed", p])
+                cmds.append(["liquidctl", "-m", m, "set", ch, "duty", p])
+        elif kind == "pump":
+            # Pumps only support a single channel.  There is no "pumps" alias.
+            # Try speed first, then duty as a fallback.
+            cmds.append(["liquidctl", "-m", m, "set", "pump", "speed", p])
+            cmds.append(["liquidctl", "-m", m, "set", "pump", "duty", p])
         return cmds
 
     def _try_cmds(self, cmds, timeout=6):
-        """Attempt to execute one of several candidate commands.
-
-        When using the CLI backend this will iterate through all provided
-        commands, running each until one succeeds.  When using the Python
-        library we instead parse the command structure to call the
-        appropriate API methods.  Only the first candidate is attempted when
-        using the API, since either the operation will succeed or it will
-        raise.
-        """
         if self.use_cli:
             for c in cmds:
                 try:
@@ -1270,55 +1606,40 @@ class LiquidCtlGUI(QMainWindow):
                 except Exception as e:
                     log.debug(f"command failed: {' '.join(c)} -> {e}")
             return False
-        # API backend: parse the command parameters and dispatch to the
-        # appropriate set speed call.  The expected format is
-        # ["liquidctl", "-m", <model>, "set", <channel>, <mode>, <percent>].
         for c in cmds:
             try:
+                # A valid CLI command will have at least: liquidctl, -m, model, set, <channel>, <mode>, <value>
                 if len(c) < 7:
                     continue
                 channel = c[4]
-                # percent is always the last element
                 pct_str = c[-1]
                 try:
                     pct = int(pct_str)
                 except Exception:
+                    # Fall back to float conversion, then cast to int
                     pct = int(float(pct_str))
-                if channel.startswith('fan'):
-                    if channel == 'fan':
-                        self._lib_set_speed('fan', None, pct)
-                    else:
-                        try:
-                            idx = int(channel[3:])
-                        except Exception:
-                            idx = None
-                        self._lib_set_speed('fan', idx, pct)
-                    return True
-                elif channel == 'pump':
+                # Normalize channel strings for the API calls
+                ch = channel.strip().lower() if isinstance(channel, str) else ''
+                # Handle pumps directly
+                if ch == 'pump':
                     self._lib_set_speed('pump', None, pct)
+                    return True
+                # Fans can be addressed collectively or individually
+                if ch in ('fans', 'fan'):
+                    # Apply to all fans
+                    self._lib_set_speed('fan', None, pct)
+                    return True
+                if ch.startswith('fan'):
+                    # Extract digits from channel (e.g. "fan1" or "fan 1")
+                    m = re.search(r'fan\s*(\d+)', ch)
+                    idx = int(m.group(1)) if m else None
+                    self._lib_set_speed('fan', idx, pct)
                     return True
             except Exception as e:
                 log.debug(f"API command failed: {c} -> {e}")
         return False
 
     def _lib_set_speed(self, kind, index, percent):
-        """Set a fan or pump speed using the liquidctl Python API.
-
-        Parameters
-        ----------
-        kind: str
-            Either 'fan' or 'pump'.
-        index: int or None
-            For fans, the 1-based channel index.  If None, all fans will be
-            targeted when supported by the driver.  Ignored for pumps.
-        percent: int
-            The desired duty percentage (0–100).
-
-        Returns
-        -------
-        bool
-            True if the operation appears to have succeeded, False otherwise.
-        """
         dev = None
         if isinstance(self.selected_device, dict):
             dev = self.selected_device.get('device')
@@ -1327,26 +1648,25 @@ class LiquidCtlGUI(QMainWindow):
         try:
             with dev.connect():
                 if kind == 'pump':
-                    # Set pump speed; some drivers may not implement pump control
+                    self._append_debug(f"$ dev.set_fixed_speed('pump', {percent})")
                     dev.set_fixed_speed('pump', percent)
                 elif kind == 'fan':
                     if index is None:
-                        # Try to set all fans at once; if unsupported, fall back
                         try:
+                            self._append_debug(f"$ dev.set_fixed_speed('fan', {percent})")
                             dev.set_fixed_speed('fan', percent)
                         except Exception:
-                            # Fall back to per-channel update for each fan
                             for chan in range(1, self.fan_count + 1):
                                 try:
+                                    self._append_debug(f"$ dev.set_fixed_speed('fan{chan}', {percent})")
                                     dev.set_fixed_speed(f'fan{chan}', percent)
                                 except Exception:
                                     pass
                     else:
-                        # Specific fan channel
+                        self._append_debug(f"$ dev.set_fixed_speed('fan{index}', {percent})")
                         dev.set_fixed_speed(f'fan{index}', percent)
             return True
         except Exception as e:
-            # Log and surface the error through the status bar; avoid crashing.
             try:
                 self.show_status_message(f"Failed to set {kind} speed: {e}")
             except Exception:
@@ -1380,10 +1700,6 @@ class LiquidCtlGUI(QMainWindow):
 
     def apply_all_fan_speeds(self):
         speeds=[s.value() for s in self.fan_sliders]
-        # Apply all fan speeds asynchronously.  When using the CLI backend the
-        # commands are executed via the CLI; when using the Python API we call
-        # the library directly.  The per-channel loop ensures that drivers
-        # lacking an all-fan command still receive the correct duty per fan.
         def worker():
             if self.use_cli:
                 for fan_id, pct in enumerate(speeds, 1):
@@ -1458,7 +1774,6 @@ class LiquidCtlGUI(QMainWindow):
         return "N/A"
 
     def read_gpu_model(self):
-        """Return a short, human GPU name (NVIDIA/AMD/Intel) without lspci noise."""
         try:
             if shutil.which("nvidia-smi"):
                 out = run_cmd(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], timeout=3)
@@ -1590,42 +1905,71 @@ class LiquidCtlGUI(QMainWindow):
         label.setText(txt); edit.hide(); label.show()
 
     def add_fan_controls(self, count, font):
-        # Clear existing
-        for lay in getattr(self, "fan_rows_layouts", []):
-            while lay.count():
-                w = lay.takeAt(0).widget()
-                if w: w.setParent(None)
+        # Clear the previous grid widget (simplest approach)
+        try:
+            if hasattr(self, "fan_grid_widget") and self.fan_grid_widget is not None:
+                self.control_layout.removeWidget(self.fan_grid_widget)
+                self.fan_grid_widget.setParent(None)
+        except Exception:
+            pass
+
         self.fan_rows_layouts=[]
-        for l in getattr(self,"fan_rpm_inline_labels",[]): l.deleteLater()
-        for l in getattr(self,"fan_percent_inline_labels",[]): l.deleteLater()
-        for s in getattr(self,"fan_sliders",[]): s.deleteLater()
-        for l in getattr(self,"fan_name_labels",[]): l.deleteLater()
-        for e in getattr(self, "fan_name_edits", {}).values(): e.deleteLater()
-        self.fan_name_edits={}; self.fan_name_labels=[]
-        self.fan_rpm_inline_labels=[]; self.fan_percent_inline_labels=[]; self.fan_sliders=[]
+        self.fan_rpm_inline_labels=[]; self.fan_percent_inline_labels=[]; self.fan_sliders=[]; self.fan_name_labels=[]
+        self.fan_name_edits={}
 
-        # Build rows
-        for i in range(count):
-            row = QHBoxLayout(); compactify(row)
-            name_lbl = RenamableLabel(self.conf.get("fan_names", {}).get(str(i+1), f"Fan {i+1}"))
-            name_lbl.setFont(font); name_lbl.setFixedWidth(NAME_COL_W)
-            name_lbl.requestEdit.connect(lambda idx=i+1: self._start_edit_name(idx))
-            name_edit = QLineEdit(); name_edit.setFont(font); name_edit.setFixedWidth(NAME_COL_W); name_edit.setVisible(False)
-            name_edit.editingFinished.connect(lambda idx=i+1: self._finish_edit_name(idx))
+        # Number of rows per column – chosen so it fits vertically; the remainder goes into the next column (side scroll)
+        per_col = 8 if not self.compact else 10
+        cols = max(1, math.ceil(count / per_col))
 
-            rpm_lbl  = QLabel("N/A"); rpm_lbl.setFont(font); rpm_lbl.setFixedWidth(RPM_COL_W)
-            perc_lbl = QLabel("0 %");  perc_lbl.setFont(font); perc_lbl.setFixedWidth(PCT_COL_W)
+        self.fan_grid_widget = QWidget()
+        cols_layout = QHBoxLayout()
+        compactify(cols_layout)
 
-            s = QSlider(Qt.Orientation.Horizontal); s.setRange(0,100); s.setTickInterval(10); s.setSingleStep(10)
-            s.setTickPosition(QSlider.TickPosition.TicksBelow); s.setMinimumHeight(SLIDER_H); s.setStyleSheet(fan_slider_style)
-            s.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            s.valueChanged.connect(lambda v, fid=i+1: self.adjust_fan_speed(fid, v))
+        # Fixed column width so QScrollArea knows when to show a horizontal scroll bar
+        approx_col_width = NAME_COL_W + RPM_COL_W + PCT_COL_W + 360
 
-            for w in (name_lbl, name_edit, rpm_lbl, perc_lbl, s): row.addWidget(w)
-            self.control_layout.addLayout(row)
-            self.fan_rows_layouts.append(row)
-            self.fan_name_labels.append(name_lbl); self.fan_name_edits[i+1]=name_edit
-            self.fan_rpm_inline_labels.append(rpm_lbl); self.fan_percent_inline_labels.append(perc_lbl); self.fan_sliders.append(s)
+        fan_index = 0
+        for c in range(cols):
+            col_v = QVBoxLayout(); compactify(col_v)
+            for r in range(per_col):
+                if fan_index >= count:
+                    break
+                i = fan_index
+                row = QHBoxLayout(); compactify(row)
+
+                name_lbl = RenamableLabel(self.conf.get("fan_names", {}).get(str(i+1), f"Fan {i+1}"))
+                name_lbl.setFont(font); name_lbl.setFixedWidth(NAME_COL_W)
+                name_lbl.requestEdit.connect(lambda idx=i+1: self._start_edit_name(idx))
+                name_edit = QLineEdit(); name_edit.setFont(font); name_edit.setFixedWidth(NAME_COL_W); name_edit.setVisible(False)
+                name_edit.editingFinished.connect(lambda idx=i+1: self._finish_edit_name(idx))
+
+                rpm_lbl  = QLabel("N/A"); rpm_lbl.setFont(font); rpm_lbl.setFixedWidth(RPM_COL_W)
+                perc_lbl = QLabel("0 %");  perc_lbl.setFont(font); perc_lbl.setFixedWidth(PCT_COL_W)
+
+                s = QSlider(Qt.Orientation.Horizontal); s.setRange(0,100); s.setTickInterval(10); s.setSingleStep(10)
+                s.setTickPosition(QSlider.TickPosition.TicksBelow); s.setMinimumHeight(SLIDER_H); s.setStyleSheet(fan_slider_style)
+                s.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                s.valueChanged.connect(lambda v, fid=i+1: self.adjust_fan_speed(fid, v))
+
+                for w in (name_lbl, name_edit, rpm_lbl, perc_lbl, s): row.addWidget(w)
+                col_v.addLayout(row)
+
+                self.fan_rows_layouts.append(row)
+                self.fan_name_labels.append(name_lbl); self.fan_name_edits[i+1]=name_edit
+                self.fan_rpm_inline_labels.append(rpm_lbl); self.fan_percent_inline_labels.append(perc_lbl); self.fan_sliders.append(s)
+
+                fan_index += 1
+
+            # small divider line between columns (optional)
+            col_wrap = QVBoxLayout()
+            compactify(col_wrap)
+            col_container = QWidget()
+            col_container.setLayout(col_v)
+            col_container.setMinimumWidth(approx_col_width)
+            cols_layout.addWidget(col_container)
+
+        self.fan_grid_widget.setLayout(cols_layout)
+        self.control_layout.addWidget(self.fan_grid_widget)
 
     # ---------- Misc ----------
     def save_sliders_to_conf(self):
@@ -1646,44 +1990,133 @@ class LiquidCtlGUI(QMainWindow):
         self.debug_dlg.set_lines(self.debug_lines)
         self.debug_dlg.show(); self.debug_dlg.raise_(); self.debug_dlg.activateWindow()
 
+    # ---------- Graph dialog ----------
+    def open_graph_dialog(self) -> None:
+        if not hasattr(self, 'graph_dlg') or self.graph_dlg is None:
+            self.graph_dlg = GraphDialog(self)
+        t_list = list(self._hist_t)
+        cpu_list = list(self._hist_cpu)
+        water_list = list(self._hist_water)
+        try:
+            self.graph_dlg.update_data(t_list, cpu_list, water_list)
+        except Exception:
+            pass
+        self.graph_dlg.show(); self.graph_dlg.raise_(); self.graph_dlg.activateWindow()
+
+    # ---------- Dependency installation ----------
+    def check_and_install_dependencies(self) -> None:
+        missing_pkgs = []
+        dep_map = {
+            'liquidctl': 'liquidctl',
+            'sensors': 'lm-sensors',
+        }
+        for cmd, pkg in dep_map.items():
+            if shutil.which(cmd) is None:
+                missing_pkgs.append(pkg)
+        if not missing_pkgs:
+            return
+        pm = None
+        if shutil.which('apt-get'):
+            pm = 'apt-get'
+        elif shutil.which('pacman'):
+            pm = 'pacman'
+        elif shutil.which('dnf'):
+            pm = 'dnf'
+        elif shutil.which('yum'):
+            pm = 'yum'
+        elif shutil.which('zypper'):
+            pm = 'zypper'
+        if pm is None:
+            QMessageBox.warning(self, "Dependencies missing",
+                                f"The following tools are required but not installed: {', '.join(missing_pkgs)}.\nPlease install them manually using your distribution's package manager.")
+            return
+        if pm == 'apt-get':
+            install_cmd = f"pkexec bash -lc 'apt-get update -qq && apt-get install -y {' '.join(missing_pkgs)}'"
+        elif pm == 'pacman':
+            install_cmd = f"pkexec bash -lc 'pacman -Sy --noconfirm {' '.join(missing_pkgs)}'"
+        elif pm == 'dnf':
+            install_cmd = f"pkexec bash -lc 'dnf install -y {' '.join(missing_pkgs)}'"
+        elif pm == 'yum':
+            install_cmd = f"pkexec bash -lc 'yum install -y {' '.join(missing_pkgs)}'"
+        elif pm == 'zypper':
+            install_cmd = f"pkexec bash -lc 'zypper --non-interactive install {' '.join(missing_pkgs)}'"
+        else:
+            install_cmd = None
+        reply = QMessageBox.question(self, "Install missing packages",
+                                     f"The following packages are missing and are required for full functionality:\n\n{', '.join(missing_pkgs)}\n\nShall I attempt to install them now? Root privileges are required.",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes or not install_cmd:
+            return
+        try:
+            subprocess.run(install_cmd, shell=True, check=True)
+            QMessageBox.information(self, "Installation complete",
+                                    f"Installed packages: {', '.join(missing_pkgs)}.  You may need to restart the application for changes to take effect.")
+        except Exception as e:
+            QMessageBox.warning(self, "Installation failed", f"Failed to install packages: {e}")
+
     def update_graph(self, cpu_t, water_t):
-        """Update rolling graph; x-axis in seconds, with readable ticks."""
-        if not HAVE_MPL or not self.canvas or not self.canvas.isVisible(): return
+        if not HAVE_MPL:
+            return
         now = time.time()
-        if self._t0 is None: self._t0 = now
-        self._hist_t.append(now - self._t0)
+        if self._t0 is None:
+            self._t0 = now
+        rel_t = now - self._t0
+        self._hist_t.append(rel_t)
         self._hist_cpu.append(cpu_t if cpu_t is not None else float("nan"))
         self._hist_water.append(water_t if water_t is not None else float("nan"))
-
-        x = list(self._hist_t)
-        self._graph_cpu_line.set_data(x, list(self._hist_cpu))
-        self._graph_water_line.set_data(x, list(self._hist_water))
-
-        vals = [v for v in list(self._hist_cpu)+list(self._hist_water) if v==v]
-        ymin = min(vals, default=0); ymax = max(vals, default=100)
-        if ymin == ymax: ymin -= 1; ymax += 1
-
-        # show last 60–120 seconds nicely
-        xmax = max(60, int(x[-1]) if x else 60)
-        self.ax.set_xlim(max(0, xmax-120), xmax)
-        self.ax.set_ylim(max(0, ymin-2), min(120, ymax+2))
-        self.ax.set_xticks(range(max(0, xmax-120), xmax+1, 10))
-
-        # keep margins so labels are visible even when resized
-        self.fig.subplots_adjust(left=0.09, right=0.98, top=0.93, bottom=0.28)
-        self.canvas.draw_idle()
+        t_list = list(self._hist_t)
+        cpu_list = list(self._hist_cpu)
+        water_list = list(self._hist_water)
+        if t_list:
+            xmax = t_list[-1]
+            xmin = max(0.0, xmax - 60.0)
+            if xmax - xmin < 60.0:
+                xmax = xmin + 60.0
+        else:
+            xmin, xmax = 0.0, 60.0
+        if self.canvas and self.canvas.isVisible():
+            self._graph_cpu_line.set_data(t_list, cpu_list)
+            self._graph_water_line.set_data(t_list, water_list)
+            self.ax.set_xlim(xmin, xmax)
+            self.ax.set_ylim(10.0, 100.0)
+            try:
+                start_tick = int(xmin)
+                end_tick = int(xmax) + 1
+                ticks = list(range(start_tick, end_tick, 10))
+            except Exception:
+                pass
+            self.fig.subplots_adjust(left=0.09, right=0.98, top=0.93, bottom=0.28)
+            self.canvas.draw_idle()
+        if hasattr(self, 'graph_dlg') and self.graph_dlg and self.graph_dlg.isVisible():
+            try:
+                self.graph_dlg.update_data(t_list, cpu_list, water_list)
+            except Exception:
+                pass
 
     def rebuild_tray_menu(self, selected_profile=None):
         self.tray_menu.clear()
-        cur = QAction(f"Current profile: {selected_profile or '(none)'}", self); f=QFont(); f.setBold(True); cur.setFont(f); cur.setEnabled(False)
+        cur = QAction(f"Current profile: {selected_profile or '(none)'}", self);  f=QFont(); f.setBold(True); cur.setFont(f); cur.setEnabled(False)
         self.tray_menu.addAction(cur); self.tray_menu.addSeparator()
 
         about_action = QAction("About", self); about_action.triggered.connect(self.show_about)
         run_on_start_action = QAction("Run on start", self); run_on_start_action.setCheckable(True)
         run_on_start_action.setChecked(self.conf["global"].get("run_on_start", False))
         run_on_start_action.toggled.connect(self.set_autostart)
+
+        start_minimized_action = QAction("Start minimized", self)   # NEW
+        start_minimized_action.setCheckable(True)
+        start_minimized_action.setChecked(self.conf["global"].get("start_minimized", False))
+        start_minimized_action.toggled.connect(self.set_start_minimized)
+
+        add_shortcut_action = QAction("Add application shortcut to desktop", self)  # NEW
+        add_shortcut_action.triggered.connect(self.add_desktop_shortcut)
+
         show_action = QAction("Show", self); show_action.triggered.connect(self.show)
-        self.tray_menu.addAction(about_action); self.tray_menu.addAction(run_on_start_action); self.tray_menu.addAction(show_action)
+        self.tray_menu.addAction(about_action)
+        self.tray_menu.addAction(run_on_start_action)
+        self.tray_menu.addAction(start_minimized_action)  # new
+        self.tray_menu.addAction(add_shortcut_action)     # new
+        self.tray_menu.addAction(show_action)
         self.tray_menu.addSeparator()
 
         profiles_menu = QMenu("Select Profile", self)
@@ -1694,10 +2127,70 @@ class LiquidCtlGUI(QMainWindow):
         self.tray_menu.addMenu(profiles_menu)
 
         self.tray_menu.addSeparator()
-        for pct in (30,50,70,100):
+        for pct in (10,30,50,70,100):
             a = QAction(f"All fans {pct}%", self); a.triggered.connect(partial(self.adjust_all_fans, pct)); self.tray_menu.addAction(a)
         self.tray_menu.addSeparator()
-        exit_action = QAction("Exit", self); exit_action.triggered.connect(QApplication.quit); self.tray_menu.addAction(exit_action)
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.exit_app)
+        self.tray_menu.addAction(exit_action)
+
+    def exit_app(self):
+        self.closing_via_exit = True
+        try:
+            self.tray_icon.hide()
+        except Exception:
+            pass
+        QApplication.quit()
+
+    def _guess_desktop_dir(self):
+        # XDG
+        xdg_file = os.path.join(HOME, ".config", "user-dirs.dirs")
+        if os.path.exists(xdg_file):
+            try:
+                with open(xdg_file) as f:
+                    for line in f:
+                        if line.startswith("XDG_DESKTOP_DIR"):
+                            val = line.split("=",1)[1].strip().strip('"')
+                            val = val.replace("$HOME", HOME)
+                            return os.path.expanduser(val)
+            except Exception:
+                pass
+        return os.path.join(HOME, "Desktop")
+
+    def add_desktop_shortcut(self):
+        try:
+            desktop_dir = self._guess_desktop_dir()
+            os.makedirs(desktop_dir, exist_ok=True)
+            exe = sys.argv[0]
+            if not os.path.isabs(exe): exe = os.path.abspath(exe)
+            icon = None
+            # Try to find one of our icons
+            icon_try = [
+                os.path.join(os.path.dirname(__file__), "tux_icon_pack", "svg256x256.svg"),
+                os.path.join(os.path.dirname(__file__), "icon.png"),
+            ]
+            for p in icon_try:
+                if os.path.exists(p):
+                    icon = p; break
+            desktop_path = os.path.join(desktop_dir, "Liquidctl GUI.desktop")
+            content = ["[Desktop Entry]",
+                       "Type=Application",
+                       "Name=Liquidctl GUI",
+                       f'Exec="{exe}"',
+                       f'Icon={icon}' if icon else "",
+                       "Terminal=false",
+                       "Categories=Utility;GTK;",
+                       "StartupNotify=true"]
+            with open(desktop_path, "w") as f:
+                f.write("\n".join([c for c in content if c != ""]) + "\n")
+            os.chmod(desktop_path, 0o755)
+            self.show_status_message(f"Shortcut created: {desktop_path}", 4000)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to create desktop shortcut:\n{e}")
+
+    def set_start_minimized(self, enabled):
+        self.conf["global"]["start_minimized"] = bool(enabled)
+        save_json_config(self.conf)
 
     def set_autostart(self, enabled):
         enabled = bool(enabled)
@@ -1706,17 +2199,37 @@ class LiquidCtlGUI(QMainWindow):
         try:
             if enabled:
                 os.makedirs(AUTOSTART_DIR, exist_ok=True)
-                exe = sys.argv[0];
-                if not os.path.isabs(exe): exe = os.path.abspath(exe)
-                desktop = f"""[Desktop Entry]
-Type=Application
-Name=Liquidctl GUI
-Exec="{exe}"
-X-GNOME-Autostart-enabled=true
-"""
-                with open(AUTOSTART_FILE, "w") as f: f.write(desktop)
+                exe = sys.argv[0]
+                if not os.path.isabs(exe):
+                    exe = os.path.abspath(exe)
+                icon_path = None
+                icon_dir = os.path.join(os.path.dirname(__file__), "tux_icon_pack")
+                if os.path.isdir(icon_dir):
+                    cand = os.path.join(icon_dir, "png32x32.png")
+                    if os.path.exists(cand):
+                        icon_path = cand
+                    else:
+                        cand2 = os.path.join(icon_dir, "svg256x256.svg")
+                        if os.path.exists(cand2):
+                            icon_path = cand2
+                        else:
+                            cand3 = os.path.join(os.path.dirname(__file__), "icon.png")
+                            if os.path.exists(cand3):
+                                icon_path = cand3
+                desktop_lines = [
+                    "[Desktop Entry]",
+                    "Type=Application",
+                    "Name=Liquidctl GUI",
+                    f"Exec=/usr/bin/env python3 {exe}",
+                    f"Icon={icon_path}" if icon_path else "",
+                    "Terminal=false",
+                    "X-GNOME-Autostart-enabled=true"
+                ]
+                with open(AUTOSTART_FILE, "w") as f:
+                    f.write("\n".join([c for c in desktop_lines if c != ""]) + "\n")
             else:
-                if os.path.exists(AUTOSTART_FILE): os.remove(AUTOSTART_FILE)
+                if os.path.exists(AUTOSTART_FILE):
+                    os.remove(AUTOSTART_FILE)
         except Exception as e:
             self._append_debug(f"Autostart error: {e}")
 
@@ -1732,21 +2245,96 @@ Creator: Nele
         self.pump_slider.blockSignals(block)
 
     def closeEvent(self, event):
-        event.ignore(); self.hide()
-        self.tray_icon.showMessage("LiquidctlGUI","Minimized to tray. Use 'Exit' to close.",
-                                   QSystemTrayIcon.MessageIcon.Information, 2000)
+        if getattr(self, 'closing_via_exit', False):
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        try:
+            self.tray_icon.showMessage(
+                "LiquidctlGUI",
+                "Minimized to tray. Use 'Exit' to close.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000,
+            )
+        except Exception:
+            pass
 
 # ---------- main ----------
 def main():
-    if not shutil.which("liquidctl"):
-        app = QApplication(sys.argv)
-        QMessageBox.critical(None, "Error", "liquidctl is not installed! Please install it and try again.")
-        sys.exit(1)
     app = QApplication(sys.argv)
-    for p in [os.path.join(os.path.dirname(__file__), "icon.png"),
-              "/usr/share/icons/liquidctl-gui.png","/usr/local/share/icons/liquidctl-gui.png"]:
-        if os.path.exists(p): app.setWindowIcon(QIcon(p)); break
-    gui = LiquidCtlGUI(); gui.show()
+
+    def _load_tux_icon_for_app():
+        try:
+            from PyQt6.QtCore import QSize
+            from PyQt6.QtGui import QPixmap, QImage, QPalette
+        except Exception:
+            return None
+        icon_dir = os.path.join(os.path.dirname(__file__), "tux_icon_pack")
+        if not os.path.isdir(icon_dir):
+            return None
+        icon = QIcon()
+        try:
+            pal = app.palette()
+            is_dark = pal.color(QPalette.ColorRole.Window).lightness() < 128
+        except Exception:
+            is_dark = False
+        sizes = [16, 22, 24, 32, 48, 64, 128, 256]
+        found_any = False
+        for sz in sizes:
+            fname = f"png{sz}x{sz}.png"
+            fpath = os.path.join(icon_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    pix = QPixmap(fpath)
+                    if is_dark:
+                        img = pix.toImage()
+                        img.invertPixels(QImage.InvertMode.InvertRgb)
+                        pix = QPixmap.fromImage(img)
+                    icon.addPixmap(pix, QIcon.Mode.Normal, QIcon.State.Off)
+                    found_any = True
+                except Exception:
+                    icon.addFile(fpath, QSize(sz, sz))
+                    found_any = True
+        svg_path = os.path.join(icon_dir, "svg256x256.svg")
+        if os.path.exists(svg_path):
+            icon.addFile(svg_path)
+            found_any = True
+        return icon if found_any and not icon.isNull() else None
+
+    app_icon = _load_tux_icon_for_app()
+    if app_icon is None:
+        icon_paths = [
+            os.path.join(os.path.dirname(__file__), "icon.png"),
+            "/usr/share/icons/liquidctl-gui.png",
+            "/usr/local/share/icons/liquidctl-gui.png",
+        ]
+        for pth in icon_paths:
+            if os.path.exists(pth):
+                app_icon = QIcon(pth)
+                break
+    if app_icon and not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+
+    gui = LiquidCtlGUI()
+    # Start minimized option
+    try:
+        if gui.conf["global"].get("start_minimized", False):
+            gui.hide()
+            try:
+                gui.tray_icon.showMessage(
+                    "LiquidctlGUI",
+                    "Started minimized to tray.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    1500,
+                )
+            except Exception:
+                pass
+        else:
+            gui.show()
+    except Exception:
+        gui.show()
+
     sys.exit(app.exec())
 
 if __name__ == "__main__":
