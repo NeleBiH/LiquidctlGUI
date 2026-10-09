@@ -1,4 +1,4 @@
-THIS PROJECT WILL NOT BE UPDATED I AM DOING FULL ICUE REPLACMENT INSTEAD OF THIS 
+THIS PROJECT WILL NOT BE UPDATED I AM DOING FULL ICUE REPLACEMENT INSTEAD OF THIS 
 -----------------------------------------------------------------------------------------------------------------------------------------
 A simple GUI for [liquidctl](https://github.com/liquidctl/liquidctl) to control **fans** and **pump** on devices such as the Corsair Commander Core.  
 Unfortunately i have only one device to test so if you run this please let me know does it work.
